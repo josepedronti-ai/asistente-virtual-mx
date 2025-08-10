@@ -1,0 +1,115 @@
+from fastapi import APIRouter, Form
+from fastapi.responses import PlainTextResponse
+from sqlalchemy.orm import Session
+from datetime import timedelta
+from dateutil import parser as dtparser
+
+from ..database import SessionLocal
+from ..config import settings
+from .. import models
+from ..services.notifications import send_text
+from ..services.scheduling import available_slots
+
+router = APIRouter(prefix="", tags=["webhooks"])
+
+def db_session():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def find_latest_reserved_for_contact(db: Session, contact: str):
+    return (
+        db.query(models.Appointment)
+        .join(models.Patient)
+        .filter(models.Patient.contact == contact)
+        .filter(models.Appointment.status != models.AppointmentStatus.canceled)
+        .order_by(models.Appointment.start_at.desc())
+        .first()
+    )
+
+@router.post("/webhooks/whatsapp", response_class=PlainTextResponse)
+async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
+    if not From:
+        return "ok"
+
+    text = (Body or "").strip().lower()
+
+    if text in ("hola", "buenas", "menu", "menú"):
+        send_text(From,
+            "👋 Hola, soy el asistente del Dr. Ontiveros.\n"
+            "Responde *Sí* para confirmar tu cita o *No* para cambiarla.\n"
+            "También puedes escribir una fecha (AAAA-MM-DD) para ver horarios."
+        )
+        return "ok"
+
+    if text in ("si", "sí"):
+        for db in db_session():
+            appt = find_latest_reserved_for_contact(db, From)
+            if not appt:
+                send_text(From, "No encontré una cita pendiente. ¿Me envías la fecha (AAAA-MM-DD)?")
+                break
+            appt.status = models.AppointmentStatus.confirmed
+            db.commit()
+            send_text(From, f"✅ Cita *confirmada* para {appt.start_at.isoformat()}. ¡Te vemos pronto!")
+        return "ok"
+
+    if text == "no":
+        for db in db_session():
+            appt = find_latest_reserved_for_contact(db, From)
+            if not appt:
+                send_text(From, "No tengo una cita pendiente. ¿Qué día quieres? (AAAA-MM-DD)")
+                break
+            d = appt.start_at.date()
+            slots = available_slots(db, d, settings.TIMEZONE)
+            if not slots:
+                slots = available_slots(db, d + timedelta(days=1), settings.TIMEZONE)
+            options = slots[:3]
+            if not options:
+                send_text(From, "No tengo opciones cercanas. ¿Me das otra fecha (AAAA-MM-DD)?")
+                break
+            lines = [f"{i+1}) {s.isoformat()}" for i, s in enumerate(options)]
+            send_text(From,
+                "Estas son mis mejores opciones:\n" + "\n".join(lines) +
+                "\nResponde con *1*, *2* o *3* para elegir."
+            )
+        return "ok"
+
+    if text in ("1", "2", "3"):
+        idx = int(text) - 1
+        for db in db_session():
+            appt = find_latest_reserved_for_contact(db, From)
+            if not appt:
+                send_text(From, "No encuentro una cita pendiente. Escríbeme una fecha (AAAA-MM-DD).")
+                break
+            d = appt.start_at.date()
+            slots = available_slots(db, d, settings.TIMEZONE)
+            if not slots:
+                slots = available_slots(db, d + timedelta(days=1), settings.TIMEZONE)
+            options = slots[:3]
+            if idx >= len(options):
+                send_text(From, "Esa opción ya no está disponible. Intenta con 1, 2 o 3.")
+                break
+            new_start = options[idx]
+            appt.start_at = new_start
+            appt.status = models.AppointmentStatus.reserved
+            db.commit()
+            send_text(From, f"🔁 Listo, cambié tu cita a {new_start.isoformat()}. ¿*Sí* para confirmar?")
+        return "ok"
+
+    try:
+        d = dtparser.parse(text).date()
+        for db in db_session():
+            slots = available_slots(db, d, settings.TIMEZONE)
+            if not slots:
+                send_text(From, "No veo horarios ese día. Prueba otra fecha (AAAA-MM-DD).")
+                break
+            sample = "\n".join(s.isoformat() for s in slots[:6])
+            send_text(From, "Horarios disponibles:\n" + sample + "\nResponde *No* si quieres que te sugiera 3 opciones.")
+        return "ok"
+    except Exception:
+        pass
+
+    send_text(From, "No te entendí. Escribe *Sí*, *No* o una fecha (AAAA-MM-DD).")
+    return "ok"
