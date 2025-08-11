@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Form
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
-from datetime import timedelta
 from dateutil import parser as dtparser
 import unicodedata
 
@@ -45,10 +44,8 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     raw_text = Body or ""
     text = normalize(raw_text)
 
-    # ----------------------------
-    # Saludo profesional
-    # ----------------------------
-    if text in ("hola", "buenas", "menu", "buenos dias", "buenas tardes", "buenas noches"):
+    # Saludo inicial (humano)
+    if text in ("hola", "buenas", "menu", "menú", "buenos dias", "buenas tardes", "buenas noches"):
         send_text(
             From,
             "👋 ¡Hola! Soy el asistente virtual del Dr. Ontiveros, cardiólogo intervencionista.\n"
@@ -57,13 +54,11 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             "• Programar una cita\n"
             "• Confirmar o reprogramar\n"
             "• Información sobre costos, ubicación o preparación\n\n"
-            "Escríbeme lo que necesitas y me encargaré de ayudarte de inmediato."
+            "Cuéntame y te ayudo enseguida."
         )
         return ""
 
-    # ----------------------------
-    # 🧠 NLU (cerebro) por intención
-    # ----------------------------
+    # 🧠 NLU (intenciones + entidades)
     nlu = analizar(raw_text)
     intent = nlu.get("intent", "fallback")
     entities = nlu.get("entities", {}) or {}
@@ -75,25 +70,21 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     time_pref = entities.get("time_pref")  # "manana"/"tarde"/"noche"
     topic = entities.get("topic")
 
-    # ----------------------------
-    # Información general
-    # ----------------------------
+    # Información
     if intent == "info":
         if topic in ("costos", "costo", "precio", "precios"):
-            send_text(From, "Con gusto. Los costos varían según el tipo de consulta. ¿Qué consulta te interesa?")
+            send_text(From, "Los costos varían según el tipo de consulta. ¿Quieres saber el precio de consulta inicial o de seguimiento?")
             return ""
         if topic in ("ubicacion", "direccion"):
-            send_text(From, "Estamos en Clínica ABC, Av. Ejemplo 123, León, Gto. Hay estacionamiento en sitio 🚗.")
+            send_text(From, "📍 Estamos en Clínica ABC, Av. Ejemplo 123, León, Gto. Hay estacionamiento en sitio 🚗.")
             return ""
         if topic in ("preparacion",):
-            send_text(From, "Preparación general: llega 10 min antes, trae identificación y estudios previos si los tienes.")
+            send_text(From, "Te recomiendo llegar 10 min antes, llevar identificación y estudios previos si los tienes.")
             return ""
-        send_text(From, reply or "¿Te interesa costos, ubicación o preparación?")
+        send_text(From, reply or "¿Buscas costos, ubicación o preparación?")
         return ""
 
-    # ----------------------------
-    # Agendar o reprogramar
-    # ----------------------------
+    # Agendar / Reprogramar
     if intent in ("book", "reschedule"):
         if nlu_date:
             try:
@@ -101,25 +92,21 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 for db in db_session():
                     slots = available_slots(db, d, settings.TIMEZONE)
                     if not slots:
-                        send_text(From, "No veo horarios ese día. ¿Otro día u otro turno (mañana/tarde)?")
+                        send_text(From, "No veo horarios ese día. ¿Prefieres otro día u otro turno (mañana/tarde)?")
                         break
-                    sample = "\n".join(s.isoformat() for s in slots[:6])
+                    sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
                     send_text(
                         From,
                         "Estos son algunos horarios que tengo:\n" + sample +
-                        "\nResponde con la *hora exacta* que prefieras (por ejemplo: 10:30 o 4:15 pm). "
-                        "Si quieres más opciones, escribe *cambiar*."
+                        "\nResponde con la *hora exacta* que prefieras (por ejemplo: 10:30 o 4:15 pm)."
                     )
                 return ""
             except Exception:
                 pass
-        # Sin fecha clara → pídela de forma natural
-        send_text(From, reply or "Perfecto. ¿Qué día te gustaría? Puedes decirlo con tus palabras (p. ej., '15 de agosto por la tarde').")
+        send_text(From, reply or "¿Qué día te gustaría?")
         return ""
 
-    # ----------------------------
-    # Confirmar cita (solo si está en reserved)
-    # ----------------------------
+    # Confirmar (solo si hay un horario reservado pendiente)
     if intent == "confirm":
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
@@ -128,12 +115,10 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 break
             appt.status = models.AppointmentStatus.confirmed
             db.commit()
-            send_text(From, f"✅ Confirmé tu cita para {appt.start_at.isoformat()}. ¿Algo más en lo que te ayude?")
+            send_text(From, f"✅ Tu cita quedó confirmada para {appt.start_at.strftime('%d/%m/%Y a las %H:%M')}.\n¿Algo más en lo que te ayude?")
         return ""
 
-    # ----------------------------
-    # Cancelar cita
-    # ----------------------------
+    # Cancelar
     if intent == "cancel":
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
@@ -142,22 +127,17 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 break
             appt.status = models.AppointmentStatus.canceled
             db.commit()
-            send_text(From, "🗑️ He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios.")
+            send_text(From, "He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios.")
         return ""
 
-    # ----------------------------
-    # Pequeña charla o saludo detectado por NLU
-    # ----------------------------
+    # Smalltalk / Greet detectado por NLU
     if intent in ("smalltalk", "greet"):
         if reply:
             send_text(From, reply)
             return ""
 
-    # ----------------------------
-    # Parser de fecha y hora naturales (ej. “15 de agosto 10:30 am”)
-    # ----------------------------
+    # Parser natural de fecha y HORA (p. ej. “15 de agosto 10:30 am”)
     try:
-        # Detecta fecha y, si viene, hora
         dt = dtparser.parse(text, dayfirst=False, fuzzy=True)
         d = dt.date()
 
@@ -167,7 +147,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 send_text(From, "No veo horarios ese día. ¿Quieres intentar con otro día u otro turno (mañana/tarde)?")
                 break
 
-            lowered = text.lower()
+            lowered = raw_text.lower()
             has_time_hint = (":" in lowered) or (" am" in lowered) or (" pm" in lowered)
 
             if has_time_hint:
@@ -179,15 +159,15 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         match = s
                         break
                 if match:
-                    # Aquí solo proponemos el slot elegido; la creación/reserva real puede hacerse en tu flujo de DB
+                    # Proponemos ese slot explícitamente
                     send_text(
                         From,
-                        f"📌 Excelente, tengo {match.isoformat()} disponible. "
+                        f"📌 Tengo {match.strftime('%d/%m/%Y %H:%M')} disponible.\n"
                         "Escribe *confirmar* para confirmar o *cambiar* para ver otras opciones."
                     )
                     break
                 else:
-                    sample = "\n".join(s.isoformat() for s in slots[:6])
+                    sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
                     send_text(
                         From,
                         "No tengo exactamente esa hora, pero cuento con:\n" + sample +
@@ -196,7 +176,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     break
             else:
                 # Solo fecha → listamos opciones
-                sample = "\n".join(s.isoformat() for s in slots[:6])
+                sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
                 send_text(
                     From,
                     "Estos son algunos horarios que tengo:\n" + sample +
@@ -206,9 +186,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     except Exception:
         pass
 
-    # ----------------------------
     # Fallback final (respuesta natural del NLU)
-    # ----------------------------
-    final = analizar(raw_text)  # analizar devuelve dict
+    final = analizar(raw_text)  # devuelve dict
     send_text(From, final.get("reply", "¿Buscas agendar, confirmar/reprogramar o información (costos, ubicación, preparación)?"))
     return ""
