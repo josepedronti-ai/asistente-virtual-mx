@@ -9,6 +9,7 @@ from ..config import settings
 from .. import models
 from ..services.notifications import send_text
 from ..services.scheduling import available_slots
+from ..services.nlu import analizar_mensaje
 
 router = APIRouter(prefix="", tags=["webhooks"])
 
@@ -111,5 +112,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     except Exception:
         pass
 
-    send_text(From, "No te entendí. Escribe *Sí*, *No* o una fecha (AAAA-MM-DD).")
-    return "ok"
+    # Fallback con OpenAI (respuesta natural)
+respuesta = analizar_mensaje(Body or "")
+send_text(From, respuesta)
+return "ok"
