@@ -40,12 +40,13 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     if text in ("hola", "buenas", "menu", "menú", "buenos días", "buenas tardes", "buenas noches"):
         send_text(
             From,
-            "👋 Hola, soy el asistente del Dr. Ontiveros.\n"
-            "¿En qué te ayudo hoy?\n"
-            "• Agendar una cita\n"
-            "• Confirmar o cambiar una cita\n"
-            "• Información (costos, ubicación, cómo llegar)\n"
-            "Puedes escribirlo con tus palabras 🙂"
+            "👋 ¡Hola! Soy el asistente virtual del Dr. Ontiveros, cardiólogo intervencionista.\n"
+            "Estoy aquí para ayudarte de forma rápida y sencilla.\n\n"
+            "¿En qué puedo apoyarte hoy?\n"
+            "• Programar una cita\n"
+            "• Confirmar o reprogramar\n"
+            "• Información sobre costos, ubicación o preparación\n\n"
+            "Escríbeme lo que necesitas y me encargaré de ayudarte de inmediato."
         )
         return ""
 
