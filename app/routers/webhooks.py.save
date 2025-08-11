@@ -112,7 +112,5 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     except Exception:
         pass
 
-    # Fallback con OpenAI (respuesta natural)
-    respuesta = analizar_mensaje(Body or "")
-    send_text(From, respuesta)
+    send_text(From, "No te entendí. Escribe *Sí*, *No* o una fecha (AAAA-MM-DD).")
     return "ok"
