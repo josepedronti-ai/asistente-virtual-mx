@@ -2,7 +2,8 @@
 import os
 from .twilio_client import send_whatsapp
 
-# Activa el modo “seco” vía variable de entorno: TWILIO_DRY_RUN=true
+# Activa el modo “seco” vía variable de entorno:
+# En Render → Environment:  TWILIO_DRY_RUN=true
 DRY_RUN = os.getenv("TWILIO_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 def send_confirmation(contact: str, slot_iso: str) -> None:
@@ -30,7 +31,10 @@ def send_text(contact: str, body: str) -> None:
 # ------------------ internos ------------------
 
 def _send(contact: str, body: str) -> None:
-    """Respeta el modo seco: imprime en logs en lugar de enviar por Twilio."""
+    """
+    Respeta el modo seco: imprime en logs en lugar de enviar por Twilio.
+    Para volver a enviar de verdad, pon TWILIO_DRY_RUN=false (o bórrala) y redeploy.
+    """
     if DRY_RUN:
         print(f"[DRY_RUN WHATSAPP] to={contact} body={body.replace(chr(10), ' | ')}")
         return
