@@ -3,14 +3,30 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 from dateutil import parser as dtparser
 import unicodedata
-from zoneinfo import ZoneInfo  # NUEVO
+from zoneinfo import ZoneInfo
 
 from ..database import SessionLocal
 from ..config import settings
 from .. import models
 from ..services.notifications import send_text
 from ..services.scheduling import available_slots
-from ..services.nlu import analizar
+from ..services.nlu import analizar  # <- respeta HYBRID_MODE desde nlu.py
+
+# ========================= Helpers & Consts =========================
+
+MENU_TEXT = (
+    "👋 ¡Hola! Soy el asistente virtual del Dr. Ontiveros, cardiólogo intervencionista.\n"
+    "Estoy aquí para ayudarte de forma rápida y sencilla.\n\n"
+    "¿En qué puedo apoyarte hoy?\n"
+    "1) Programar una cita\n"
+    "2) Confirmar\n"
+    "3) Reprogramar/Cambiar\n"
+    "4) Información (costos, ubicación, preparación)\n\n"
+    "Escribe el número u opción. (Escribe *menu* para empezar de nuevo)"
+)
+
+def send_menu(contact: str):
+    send_text(contact, MENU_TEXT)
 
 def normalize(s: str) -> str:
     s = (s or "").strip().lower()
@@ -20,15 +36,14 @@ def normalize(s: str) -> str:
 
 router = APIRouter(prefix="", tags=["webhooks"])
 
-# ---- Contexto volátil por contacto (guarda día/slots entre mensajes) ----
-PENDING = {}  # { contact: {"date": date, "slots": [datetime,...]} }
+# Contexto simple en memoria: {contact: {"date": date, "slots": [datetime...]}}
+PENDING = {}
 
 def set_pending(contact, date_obj, slots_list):
     PENDING[contact] = {"date": date_obj, "slots": slots_list}
 
 def get_pending(contact):
     return PENDING.get(contact) or {}
-# -------------------------------------------------------------------------
 
 def db_session():
     db = SessionLocal()
@@ -47,6 +62,35 @@ def find_latest_reserved_for_contact(db: Session, contact: str):
         .first()
     )
 
+def get_or_create_patient(db: Session, contact: str):
+    p = db.query(models.Patient).filter(models.Patient.contact == contact).first()
+    if p:
+        return p
+    p = models.Patient(contact=contact, name=None)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return p
+
+def reserve_slot_for_contact(contact: str, match_dt):
+    """Crea/actualiza una cita en estado 'reserved' para que luego pueda confirmarse."""
+    for db in db_session():
+        patient = get_or_create_patient(db, contact)
+        appt = find_latest_reserved_for_contact(db, contact)
+        if not appt or appt.status == models.AppointmentStatus.confirmed:
+            appt = models.Appointment(
+                patient_id=patient.id,
+                start_at=match_dt,
+                status=models.AppointmentStatus.reserved
+            )
+            db.add(appt)
+        else:
+            appt.start_at = match_dt
+            appt.status = models.AppointmentStatus.reserved
+        db.commit()
+
+# ========================= Ruta WhatsApp =========================
+
 @router.post("/webhooks/whatsapp", response_class=PlainTextResponse)
 async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     if not From:
@@ -55,47 +99,57 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     raw_text = Body or ""
     text = normalize(raw_text)
 
-    # Saludo inicial (humano)
+    # Atajos globales / menú
     if text in ("hola", "buenas", "menu", "menú", "buenos dias", "buenas tardes", "buenas noches"):
-        send_text(
-            From,
-            "👋 ¡Hola! Soy el asistente virtual del Dr. Ontiveros, cardiólogo intervencionista.\n"
-            "Estoy aquí para ayudarte de forma rápida y sencilla.\n\n"
-            "¿En qué puedo apoyarte hoy?\n"
-            "• Programar una cita\n"
-            "• Confirmar o reprogramar\n"
-            "• Información sobre costos, ubicación o preparación\n\n"
-            "Cuéntame y te ayudo enseguida."
-        )
+        send_menu(From)
+        return ""
+    if text == "menu":
+        send_menu(From)
         return ""
 
-    # 🧠 NLU (intenciones + entidades)
-    nlu = analizar(raw_text)
-    intent = nlu.get("intent", "fallback")
-    entities = nlu.get("entities", {}) or {}
-    reply = nlu.get("reply", "")
+    # ===== Determinista: mapear a intención por opciones/números =====
+    intent = None
+    entities = {}
+    reply = ""
 
-    print(f"[NLU] from={From} intent={intent} entities={entities} text={(raw_text)[:120]}")
+    if text in ("1", "agendar", "programar", "reservar", "sacar cita", "cita"):
+        intent = "book"
+    elif text in ("2", "confirmar", "confirmo"):
+        intent = "confirm"
+    elif text in ("3", "reprogramar", "cambiar", "modificar", "mover", "reagendar"):
+        intent = "reschedule"
+    elif text in ("4", "info", "informacion", "información", "costo", "costos", "precio", "precios", "ubicacion", "ubicación", "direccion", "dirección", "preparacion", "preparación"):
+        intent = "info"
+
+    # ===== HÍBRIDO: si no hay intención determinista, llamamos al NLU (que respeta HYBRID_MODE) =====
+    if not intent:
+        nlu = analizar(raw_text)
+        intent = nlu.get("intent") or "fallback"
+        entities = nlu.get("entities") or {}
+        reply = (nlu.get("reply") or "").strip()
+        print(f"[NLU] from={From} intent={intent} entities={entities} text={(raw_text)[:120]}")
 
     nlu_date = entities.get("date")
     time_pref = entities.get("time_pref")  # "manana"/"tarde"/"noche"
     topic = entities.get("topic")
 
+    # ===== Ramas por intención =====
+
     # Información
     if intent == "info":
         if topic in ("costos", "costo", "precio", "precios"):
-            send_text(From, "Los costos varían según el tipo de consulta. ¿Quieres saber el precio de consulta inicial o de seguimiento?")
+            send_text(From, "Los costos varían según el tipo de consulta. ¿Deseas precio de *consulta inicial* o de *seguimiento*?\n(Escribe *menu* para empezar de nuevo)")
             return ""
-        if topic in ("ubicacion", "direccion"):
-            send_text(From, "📍 Estamos en Clínica ABC, Av. Ejemplo 123, León, Gto. Hay estacionamiento en sitio 🚗.")
+        if topic in ("ubicacion", "ubicación", "direccion", "dirección"):
+            send_text(From, "📍 Clínica ABC, Av. Ejemplo 123, León, Gto. Hay estacionamiento en sitio 🚗.\n(Escribe *menu* para empezar de nuevo)")
             return ""
-        if topic in ("preparacion",):
-            send_text(From, "Te recomiendo llegar 10 min antes, llevar identificación y estudios previos si los tienes.")
+        if topic in ("preparacion", "preparación"):
+            send_text(From, "Llega 10 min antes, trae identificación y estudios previos si los tienes.\n(Escribe *menu* para empezar de nuevo)")
             return ""
-        send_text(From, reply or "¿Buscas costos, ubicación o preparación?")
+        send_text(From, (reply or "¿Te interesa *costos*, *ubicación* o *preparación*?") + "\n(Escribe *menu* para empezar de nuevo)")
         return ""
 
-    # Agendar / Reprogramar — con preferencia por turno + guardado de contexto
+    # Agendar / Reprogramar — prioriza turno y guarda contexto
     if intent in ("book", "reschedule"):
         if nlu_date:
             try:
@@ -103,10 +157,10 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 for db in db_session():
                     slots = available_slots(db, d, settings.TIMEZONE)
                     if not slots:
-                        send_text(From, "No veo horarios ese día. ¿Prefieres otro día u otro turno (mañana/tarde)?")
+                        send_text(From, "No veo horarios ese día. ¿Prefieres otro día u otro turno (mañana/tarde)?\n(Escribe *menu* para empezar de nuevo)")
                         break
 
-                    # Prioriza según time_pref si viene (manana/tarde/noche)
+                    # Prioriza según time_pref
                     if time_pref == "manana":
                         filtered = [s for s in slots if 6 <= s.hour < 12]
                     elif time_pref == "tarde":
@@ -116,21 +170,22 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     else:
                         filtered = slots
 
-                    show = filtered if filtered else slots  # si no hay del turno, muestra generales
+                    show = filtered if filtered else slots
 
-                    # Guarda contexto para la siguiente respuesta (hora suelta)
+                    # Guarda contexto (para hora suelta posterior)
                     set_pending(From, d, slots)
 
                     sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in show[:6])
                     send_text(
                         From,
                         "Estos son algunos horarios que tengo:\n" + sample +
-                        "\nResponde con la *hora exacta* que prefieras (por ejemplo: 10:30 o 4:15 pm)."
+                        "\nResponde con la *hora exacta* que prefieras (ej. 10:30 o 4:15 pm).\n(Escribe *menu* para empezar de nuevo)"
                     )
                 return ""
             except Exception:
                 pass
-        send_text(From, reply or "¿Qué día te gustaría?")
+
+        send_text(From, (reply or "¿Qué día te gustaría?") + "\n(Escribe *menu* para empezar de nuevo)")
         return ""
 
     # Confirmar (solo si hay un horario reservado pendiente)
@@ -138,11 +193,11 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
             if not appt or appt.status != models.AppointmentStatus.reserved:
-                send_text(From, "Para confirmar necesito un horario reservado. Si quieres, escribe *agendar* o *cambiar*.")
+                send_text(From, "Para confirmar necesito un horario reservado. Elige una hora de la lista o escribe *3* para cambiar.\n(Escribe *menu* para empezar de nuevo)")
                 break
             appt.status = models.AppointmentStatus.confirmed
             db.commit()
-            send_text(From, f"✅ Tu cita quedó confirmada para {appt.start_at.strftime('%d/%m/%Y a las %H:%M')}.\n¿Algo más en lo que te ayude?")
+            send_text(From, f"✅ Tu cita quedó confirmada para {appt.start_at.strftime('%d/%m/%Y a las %H:%M')}.\n(Escribe *menu* para empezar de nuevo)")
         return ""
 
     # Cancelar
@@ -150,39 +205,37 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
             if not appt:
-                send_text(From, "No encontré una cita a tu nombre. ¿Quieres agendar una nueva?")
+                send_text(From, "No encontré una cita a tu nombre. ¿Quieres agendar una nueva? Responde *1*.\n(Escribe *menu* para empezar de nuevo)")
                 break
             appt.status = models.AppointmentStatus.canceled
             db.commit()
-            send_text(From, "He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios.")
+            send_text(From, "He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios. Responde *1* para agendar.\n(Escribe *menu* para empezar de nuevo)")
         return ""
 
     # Smalltalk / Greet detectado por NLU
     if intent in ("smalltalk", "greet"):
         if reply:
-            send_text(From, reply)
+            send_text(From, reply + "\n(Escribe *menu* para empezar de nuevo)")
             return ""
+        send_menu(From)
+        return ""
 
-    # Parser natural de fecha y HORA (p. ej. “15 de agosto 10:30 am”)
+    # ===== Parser de fecha/hora libre =====
     try:
         tz = ZoneInfo(settings.TIMEZONE)
         pending = get_pending(From)
         pending_date = pending.get("date")
-        pending_slots = pending.get("slots")  # lista completa del día, sin filtrar
+        pending_slots = pending.get("slots")
 
-        # Intentamos parsear lo que mandó (puede ser solo hora)
         dt = dtparser.parse(text, dayfirst=False, fuzzy=True)
 
-        # ¿El usuario mandó solo hora? Heurística simple:
         lowered = raw_text.lower()
         has_explicit_date = any(k in lowered for k in ["202", "20/", "/", "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"])
         only_time = (":" in lowered or " am" in lowered or " pm" in lowered) and not has_explicit_date
 
         if only_time and pending_date:
-            # Combina la hora con el día en contexto
             target_h, target_m = dt.hour, dt.minute
 
-            # Si ya teníamos los slots del día, busca coincidencia exacta
             if pending_slots:
                 match = None
                 for s in pending_slots:
@@ -190,10 +243,11 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         match = s
                         break
                 if match:
+                    reserve_slot_for_contact(From, match)
                     send_text(
                         From,
-                        f"📌 Tengo {match.strftime('%d/%m/%Y %H:%M')} disponible.\n"
-                        "Escribe *confirmar* para confirmar o *cambiar* para ver otras opciones."
+                        f"📌 Aparté {match.strftime('%d/%m/%Y %H:%M')} para ti.\n"
+                        "Escribe *2* para confirmar o *3* para ver otras opciones.\n(Escribe *menu* para empezar de nuevo)"
                     )
                     return ""
                 else:
@@ -201,15 +255,15 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     send_text(
                         From,
                         "No tengo exactamente esa hora, pero cuento con:\n" + sample +
-                        "\nResponde con otra *hora exacta* (ej. 11:00), o escribe *cambiar* para más opciones."
+                        "\nResponde con otra *hora exacta* (ej. 11:00), o escribe *3* para más opciones.\n(Escribe *menu* para empezar de nuevo)"
                     )
                     return ""
             else:
-                # No teníamos slots guardados (p.ej. reinicio). Los recalculamos.
+                # Recalcular slots del día en contexto si no estaban en memoria
                 for db in db_session():
                     slots = available_slots(db, pending_date, settings.TIMEZONE)
                     if not slots:
-                        send_text(From, "No veo horarios ese día. ¿Quieres intentar con otro día u otro turno (mañana/tarde)?")
+                        send_text(From, "No veo horarios ese día. ¿Intentamos otra fecha o turno (mañana/tarde)?\n(Escribe *menu* para empezar de nuevo)")
                         break
                     match = None
                     for s in slots:
@@ -217,40 +271,42 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                             match = s
                             break
                     if match:
+                        reserve_slot_for_contact(From, match)
                         send_text(
                             From,
-                            f"📌 Tengo {match.strftime('%d/%m/%Y %H:%M')} disponible.\n"
-                            "Escribe *confirmar* para confirmar o *cambiar* para ver otras opciones."
+                            f"📌 Aparté {match.strftime('%d/%m/%Y %H:%M')} para ti.\n"
+                            "Escribe *2* para confirmar o *3* para ver otras opciones.\n(Escribe *menu* para empezar de nuevo)"
                         )
                         return ""
                     sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
                     send_text(
                         From,
                         "No tengo exactamente esa hora, pero cuento con:\n" + sample +
-                        "\nResponde con otra *hora exacta* (ej. 11:00), o escribe *cambiar* para más opciones."
+                        "\nResponde con otra *hora exacta* (ej. 11:00), o escribe *3* para más opciones.\n(Escribe *menu* para empezar de nuevo)"
                     )
                 return ""
 
-        # Si trajo fecha completa (o no hay contexto), comportamiento normal
+        # Si trajo fecha completa (o no hay contexto)
         d = dt.date()
         for db in db_session():
             slots = available_slots(db, d, settings.TIMEZONE)
             if not slots:
-                send_text(From, "No veo horarios ese día. ¿Quieres que busque en otra fecha o turno (mañana/tarde)?")
+                send_text(From, "No veo horarios ese día. ¿Quieres que busque en otra fecha o turno (mañana/tarde)?\n(Escribe *menu* para empezar de nuevo)")
                 break
-            sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
-            # Actualiza contexto al nuevo día sugerido
             set_pending(From, d, slots)
+            sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
             send_text(
                 From,
                 "Estos son algunos horarios que tengo:\n" + sample +
-                "\nResponde con la *hora exacta* que prefieras (ej. 10:30), o escribe *cambiar* para más opciones."
+                "\nResponde con la *hora exacta* que prefieras (ej. 10:30), o escribe *3* para más opciones.\n(Escribe *menu* para empezar de nuevo)"
             )
         return ""
     except Exception:
         pass
 
-    # Fallback final (respuesta natural del NLU)
-    final = analizar(raw_text)  # devuelve dict
-    send_text(From, final.get("reply", "¿Buscas agendar, confirmar/reprogramar o información (costos, ubicación, preparación)?"))
+    # ===== Fallback =====
+    if reply:
+        send_text(From, reply + "\n(Escribe *menu* para empezar de nuevo)")
+    else:
+        send_menu(From)
     return ""
