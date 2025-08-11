@@ -36,14 +36,16 @@ def send_whatsapp(to: str, body: str) -> dict:
 
     # DRY RUN: solo log, no se consume Twilio
     if DRY_RUN:
-        print(f"[DRY_RUN WHATSAPP] to={to_norm} body={body.replace('\n', ' | ')}")
+        clean_body = (body or "").replace("\n", " | ")
+        print(f"[DRY_RUN WHATSAPP] to={to_norm} body={clean_body}")
         return {"dry_run": True, "to": to_norm, "body": body}
 
     client = get_twilio_client()
 
     # MOCK si no hay credenciales/configuración
     if client is None or not from_norm:
-        print(f"[WA MOCK] to={to_norm} body={body.replace('\n', ' | ')}")
+        clean_body = (body or "").replace("\n", " | ")
+        print(f"[WA MOCK] to={to_norm} body={clean_body}")
         return {"mock": True, "to": to_norm, "body": body}
 
     try:
