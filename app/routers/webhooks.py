@@ -3,13 +3,20 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 from datetime import timedelta
 from dateutil import parser as dtparser
+import unicodedata
 
 from ..database import SessionLocal
 from ..config import settings
 from .. import models
 from ..services.notifications import send_text
 from ..services.scheduling import available_slots
-from ..services.nlu import analizar_mensaje
+from ..services.nlu import analizar
+
+def normalize(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
 
 router = APIRouter(prefix="", tags=["webhooks"])
 
@@ -35,7 +42,8 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     if not From:
         return ""
 
-    text = (Body or "").strip().lower()
+    raw_text = Body or ""
+    text = normalize(raw_text)
 
     if text in ("hola", "buenas", "menu", "menú", "buenos días", "buenas tardes", "buenas noches"):
         send_text(
@@ -97,6 +105,81 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             send_text(From, f"🔁 Listo, cambié tu cita a {new_start.isoformat()}. ¿La confirmamos con *Sí*?")
         return ""
 
+    # ===== NLU (OpenAI) — interpreta intención y entidades =====
+    nlu = analizar(Body or "")
+    intent = nlu.get("intent", "fallback")
+    entities = nlu.get("entities", {}) or {}
+    reply = nlu.get("reply", "")
+
+    # Log útil para ver qué detecta el modelo (Render Logs)
+    print(f"[NLU] from={From} intent={intent} entities={entities} text={(Body or '')[:120]}")
+
+    nlu_date = entities.get("date")
+    time_pref = entities.get("time_pref")  # "manana"/"tarde"/"noche"
+    topic = entities.get("topic")
+
+    if intent == "greet":
+        send_text(From, reply or "Hola 👋 ¿En qué te apoyo?")
+        return ""
+
+    if intent == "info":
+        if topic in ("costos","costo","precio","precios"):
+            send_text(From, "Con gusto. Los costos varían según el tipo de consulta. ¿Qué consulta te interesa?")
+            return ""
+        if topic in ("ubicacion","ubicación","direccion","dirección"):
+            send_text(From, "Estamos en Clínica ABC, Av. Ejemplo 123, León, Gto. Hay estacionamiento en sitio 🚗.")
+            return ""
+        if topic in ("preparacion","preparación"):
+            send_text(From, "Preparación general: llega 10 min antes, trae identificación y estudios previos si los tienes.")
+            return ""
+        send_text(From, reply or "¿Te interesa costos, ubicación o preparación?")
+        return ""
+
+    if intent in ("book","reschedule"):
+        if nlu_date:
+            try:
+                d = dtparser.parse(nlu_date).date()
+                for db in db_session():
+                    slots = available_slots(db, d, settings.TIMEZONE)
+                    if not slots:
+                        send_text(From, "No veo horarios ese día. ¿Otro día u otro turno (mañana/tarde)?")
+                        break
+                    sample = "\n".join(s.isoformat() for s in slots[:6])
+                    send_text(From, "Estos son algunos horarios que tengo:\n" + sample + "\nSi quieres, dime *No* y te propongo 3 top opciones.")
+                return ""
+            except Exception:
+                pass
+        send_text(From, reply or "Perfecto. ¿Qué día te gustaría? Puedes decirlo con tus palabras.")
+        return ""
+
+    if intent == "confirm":
+        for db in db_session():
+            appt = find_latest_reserved_for_contact(db, From)
+            if not appt or appt.status != models.AppointmentStatus.reserved:
+                send_text(From, "Para confirmar necesito un horario reservado. Si quieres, escribe *agendar* o *cambiar*.")
+                break
+            appt.status = models.AppointmentStatus.confirmed
+            db.commit()
+            send_text(From, f"✅ Confirmé tu cita para {appt.start_at.isoformat()}. ¿Algo más en lo que te ayude?")
+        return ""
+
+    if intent == "cancel":
+        for db in db_session():
+            appt = find_latest_reserved_for_contact(db, From)
+            if not appt:
+                send_text(From, "No encontré una cita a tu nombre. ¿Quieres agendar una nueva?")
+                break
+            appt.status = models.AppointmentStatus.canceled
+            db.commit()
+            send_text(From, "🗑️ He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios.")
+        return ""
+
+    if intent in ("smalltalk","fallback"):
+        if reply:
+            send_text(From, reply)
+            return ""
+        # si no trae reply, dejamos que siga al try: de fechas de abajo
+        
     try:
         # Permite textos tipo “15 de agosto 5pm”
         d = dtparser.parse(text, dayfirst=False, fuzzy=True).date()
@@ -121,6 +204,6 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         return ""
 
     # Fallback con OpenAI (respuesta natural)
-    respuesta = analizar_mensaje(Body or "")
+    respuesta = analizar(Body or "")
     send_text(From, respuesta)
     return ""
