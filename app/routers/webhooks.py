@@ -33,61 +33,58 @@ def find_latest_reserved_for_contact(db: Session, contact: str):
 @router.post("/webhooks/whatsapp", response_class=PlainTextResponse)
 async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     if not From:
-        return "ok"
+        return ""
 
     text = (Body or "").strip().lower()
 
-    if text in ("hola", "buenas", "menu", "menú"):
-        send_text(From,
+    if text in ("hola", "buenas", "menu", "menú", "buenos días", "buenas tardes", "buenas noches"):
+        send_text(
+            From,
             "👋 Hola, soy el asistente del Dr. Ontiveros.\n"
-            "Responde *Sí* para confirmar tu cita o *No* para cambiarla.\n"
-            "También puedes escribir una fecha (AAAA-MM-DD) para ver horarios."
+            "¿En qué te ayudo hoy?\n"
+            "• Agendar una cita\n"
+            "• Confirmar o cambiar una cita\n"
+            "• Información (costos, ubicación, cómo llegar)\n"
+            "Puedes escribirlo con tus palabras 🙂"
         )
-        return "ok"
+        return ""
 
     if text in ("si", "sí"):
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
             if not appt:
-                send_text(From, "No encontré una cita pendiente. ¿Me envías la fecha (AAAA-MM-DD)?")
+                send_text(From, "Por ahora no veo una cita pendiente a tu nombre. ¿Quieres que agendemos una?")
                 break
             appt.status = models.AppointmentStatus.confirmed
             db.commit()
-            send_text(From, f"✅ Cita *confirmada* para {appt.start_at.isoformat()}. ¡Te vemos pronto!")
-        return "ok"
+            send_text(From, f"✅ Listo, confirmé tu cita para {appt.start_at.isoformat()}. ¿Necesitas algo más?")
+        return ""
 
     if text == "no":
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
             if not appt:
-                send_text(From, "No tengo una cita pendiente. ¿Qué día quieres? (AAAA-MM-DD)")
+                send_text(From, "Sin problema. ¿Qué día te gustaría agendar? Puedes decirme la fecha con tus palabras.")
                 break
             d = appt.start_at.date()
-            slots = available_slots(db, d, settings.TIMEZONE)
-            if not slots:
-                slots = available_slots(db, d + timedelta(days=1), settings.TIMEZONE)
+            slots = available_slots(db, d, settings.TIMEZONE) or available_slots(db, d + timedelta(days=1), settings.TIMEZONE)
             options = slots[:3]
             if not options:
-                send_text(From, "No tengo opciones cercanas. ¿Me das otra fecha (AAAA-MM-DD)?")
+                send_text(From, "No tengo opciones cercanas. ¿Me das otra fecha? (por ejemplo: 15 de agosto por la tarde)")
                 break
             lines = [f"{i+1}) {s.isoformat()}" for i, s in enumerate(options)]
-            send_text(From,
-                "Estas son mis mejores opciones:\n" + "\n".join(lines) +
-                "\nResponde con *1*, *2* o *3* para elegir."
-            )
-        return "ok"
+            send_text(From, "Estas son mis mejores opciones:\n" + "\n".join(lines) + "\nResponde con 1, 2 o 3 para elegir.")
+        return ""
 
     if text in ("1", "2", "3"):
         idx = int(text) - 1
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
             if not appt:
-                send_text(From, "No encuentro una cita pendiente. Escríbeme una fecha (AAAA-MM-DD).")
+                send_text(From, "No encuentro una cita pendiente. Si quieres, dime la fecha para proponerte horarios.")
                 break
             d = appt.start_at.date()
-            slots = available_slots(db, d, settings.TIMEZONE)
-            if not slots:
-                slots = available_slots(db, d + timedelta(days=1), settings.TIMEZONE)
+            slots = available_slots(db, d, settings.TIMEZONE) or available_slots(db, d + timedelta(days=1), settings.TIMEZONE)
             options = slots[:3]
             if idx >= len(options):
                 send_text(From, "Esa opción ya no está disponible. Intenta con 1, 2 o 3.")
@@ -96,23 +93,33 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             appt.start_at = new_start
             appt.status = models.AppointmentStatus.reserved
             db.commit()
-            send_text(From, f"🔁 Listo, cambié tu cita a {new_start.isoformat()}. ¿*Sí* para confirmar?")
-        return "ok"
+            send_text(From, f"🔁 Listo, cambié tu cita a {new_start.isoformat()}. ¿La confirmamos con *Sí*?")
+        return ""
 
     try:
-        d = dtparser.parse(text).date()
+        # Permite textos tipo “15 de agosto 5pm”
+        d = dtparser.parse(text, dayfirst=False, fuzzy=True).date()
         for db in db_session():
             slots = available_slots(db, d, settings.TIMEZONE)
             if not slots:
-                send_text(From, "No veo horarios ese día. Prueba otra fecha (AAAA-MM-DD).")
+                send_text(From, "No veo horarios ese día. ¿Quieres intentar con otro día u otro turno (mañana/tarde)?")
                 break
             sample = "\n".join(s.isoformat() for s in slots[:6])
-            send_text(From, "Horarios disponibles:\n" + sample + "\nResponde *No* si quieres que te sugiera 3 opciones.")
-        return "ok"
+            send_text(From, "Estos son algunos horarios que tengo:\n" + sample + "\nSi quieres, dime *No* y te propongo 3 top opciones.")
+        return ""
     except Exception:
         pass
+
+    if any(p in text for p in ("costo", "costos", "precio", "precios", "ubicación", "direccion", "dirección", "cómo llegar", "preparación")):
+        send_text(
+            From,
+            "Con gusto 😊\n• *Ubicación*: Clínica ABC, Av. Ejemplo 123, León, Gto. (estacionamiento en sitio).\n"
+            "• *Costos*: varían según el tipo de consulta; si me dices cuál buscas te doy el monto y el tiempo estimado.\n"
+            "¿Sobre qué te gustaría saber exactamente?"
+        )
+        return ""
 
     # Fallback con OpenAI (respuesta natural)
     respuesta = analizar_mensaje(Body or "")
     send_text(From, respuesta)
-    return "ok"
+    return ""
