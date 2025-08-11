@@ -25,24 +25,24 @@ USE_OPENAI = os.getenv("USE_OPENAI_NLU", "true").lower() in ("1","true","yes")
 def _keyword_router(texto: str) -> dict:
     """
     Router básico por palabras clave (funciona sin API).
-    - Respuestas humanas (sin 'Puedes decirlo con tus palabras').
+    - Respuestas humanas.
     - Entiende 'hoy', 'mañana', 'pasado mañana' -> entities.date (ISO).
     - Entiende 'por la mañana/tarde/noche' -> entities.time_pref.
+    - Si hay date/time_pref sin verbo de agendar, asumimos intent='book'.
     """
     t = (texto or "").lower().strip()
-
     entities = {}
     now = datetime.now()
 
-    # fecha relativa (checar 'pasado mañana' antes que 'mañana')
+    # Fecha relativa (checar 'pasado mañana' antes que 'mañana')
     if "pasado mañana" in t:
         entities["date"] = (now + timedelta(days=2)).date().isoformat()
-    elif "mañana" in t and "por la " not in t:
+    elif "mañana" in t:
         entities["date"] = (now + timedelta(days=1)).date().isoformat()
     elif "hoy" in t:
         entities["date"] = now.date().isoformat()
 
-    # preferencia de turno
+    # Preferencia de turno
     if "por la mañana" in t:
         entities["time_pref"] = "manana"
     elif "por la tarde" in t:
@@ -50,6 +50,7 @@ def _keyword_router(texto: str) -> dict:
     elif "por la noche" in t:
         entities["time_pref"] = "noche"
 
+    # Intenciones explícitas
     if not t:
         return {"intent":"fallback","entities":entities,"reply":"¿Te apoyo a agendar, confirmar o reprogramar?"}
 
@@ -70,6 +71,10 @@ def _keyword_router(texto: str) -> dict:
 
     if any(k in t for k in ["costo","precio","ubicacion","ubicación","direccion","dirección","preparacion","preparación","informacion","información","info"]):
         return {"intent":"info","entities":entities,"reply":"¿Te interesa costos, ubicación o preparación?"}
+
+    # Si no hubo intención explícita pero sí hay fecha/turno → asumimos agendar
+    if entities.get("date") or entities.get("time_pref"):
+        return {"intent":"book","entities":entities,"reply":"¿Te muestro opciones para ese día?"}
 
     return {"intent":"fallback","entities":entities,"reply":"¿Buscas agendar, confirmar/reprogramar o información (costos, ubicación, preparación)?"}
 
