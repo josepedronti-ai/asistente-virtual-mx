@@ -107,7 +107,8 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     send_text(
                         From,
                         "Estos son algunos horarios que tengo:\n" + sample +
-                        "\nSi quieres más opciones, escribe *cambiar*."
+                        "\nResponde con la *hora exacta* que prefieras (por ejemplo: 10:30 o 4:15 pm). "
+                        "Si quieres más opciones, escribe *cambiar*."
                     )
                 return ""
             except Exception:
@@ -153,44 +154,54 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             return ""
 
     # ----------------------------
-    # Atajo determinista: elección 1 / 2 / 3
-    # ----------------------------
-    if text in ("1", "2", "3"):
-        idx = int(text) - 1
-        for db in db_session():
-            appt = find_latest_reserved_for_contact(db, From)
-            if not appt:
-                send_text(From, "Por ahora no tengo opciones para elegir. Escribe *agendar* o *cambiar* para continuar.")
-                break
-            d = appt.start_at.date()
-            slots = available_slots(db, d, settings.TIMEZONE) or available_slots(db, d + timedelta(days=1), settings.TIMEZONE)
-            options = slots[:3]
-            if not options or idx >= len(options):
-                send_text(From, "No hay opciones disponibles para elegir ahora. Escribe *cambiar* para proponerte nuevas.")
-                break
-            new_start = options[idx]
-            appt.start_at = new_start
-            appt.status = models.AppointmentStatus.reserved
-            db.commit()
-            send_text(From, f"🔁 Reprogramé tu cita a {new_start.isoformat()}. Escribe *confirmar* para confirmar.")
-        return ""
-
-    # ----------------------------
-    # Parser de fecha libre (ej. “15 de agosto 5pm”)
+    # Parser de fecha y hora naturales (ej. “15 de agosto 10:30 am”)
     # ----------------------------
     try:
-        d = dtparser.parse(text, dayfirst=False, fuzzy=True).date()
+        # Detecta fecha y, si viene, hora
+        dt = dtparser.parse(text, dayfirst=False, fuzzy=True)
+        d = dt.date()
+
         for db in db_session():
             slots = available_slots(db, d, settings.TIMEZONE)
             if not slots:
                 send_text(From, "No veo horarios ese día. ¿Quieres intentar con otro día u otro turno (mañana/tarde)?")
                 break
-            sample = "\n".join(s.isoformat() for s in slots[:6])
-            send_text(
-                From,
-                "Estos son algunos horarios que tengo:\n" + sample +
-                "\nSi quieres más opciones, escribe *cambiar*."
-            )
+
+            lowered = text.lower()
+            has_time_hint = (":" in lowered) or (" am" in lowered) or (" pm" in lowered)
+
+            if has_time_hint:
+                target_h = dt.hour
+                target_m = dt.minute
+                match = None
+                for s in slots:
+                    if s.hour == target_h and s.minute == target_m:
+                        match = s
+                        break
+                if match:
+                    # Aquí solo proponemos el slot elegido; la creación/reserva real puede hacerse en tu flujo de DB
+                    send_text(
+                        From,
+                        f"📌 Excelente, tengo {match.isoformat()} disponible. "
+                        "Escribe *confirmar* para confirmar o *cambiar* para ver otras opciones."
+                    )
+                    break
+                else:
+                    sample = "\n".join(s.isoformat() for s in slots[:6])
+                    send_text(
+                        From,
+                        "No tengo exactamente esa hora, pero cuento con:\n" + sample +
+                        "\nResponde con la *hora exacta* que prefieras (ej. 10:30), o escribe *cambiar* para más opciones."
+                    )
+                    break
+            else:
+                # Solo fecha → listamos opciones
+                sample = "\n".join(s.isoformat() for s in slots[:6])
+                send_text(
+                    From,
+                    "Estos son algunos horarios que tengo:\n" + sample +
+                    "\nResponde con la *hora exacta* que prefieras (ej. 10:30), o escribe *cambiar* para más opciones."
+                )
         return ""
     except Exception:
         pass
