@@ -1,3 +1,5 @@
+# app/models.py
+from typing import Optional
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy import Integer, String, DateTime, Enum, ForeignKey, Boolean, Text
 from datetime import datetime
@@ -18,44 +20,26 @@ class AppointmentStatus(str, enum.Enum):
 
 class Patient(Base):
     __tablename__ = "patients"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    # ✅ Defaults y restricciones seguras
-    name: Mapped[str] = mapped_column(
-        String(200),
-        index=True,
-        nullable=False,
-        default="Paciente"         # ← evita NULL en inserts
-    )
-    contact: Mapped[str] = mapped_column(
-        String(120),
-        index=True,
-        unique=True,               # ← un paciente por contacto
-        nullable=False             # ← obligatorio
-    )  # ejemplo: whatsapp:+52...
-    consent_messages: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True               # ← consentimiento por defecto
-    )
-
+    # <- ahora nombre puede ser NULL; lo pediremos luego en el flujo
+    name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, default=None, index=True)
+    contact: Mapped[str] = mapped_column(String(120), index=True)  # whatsapp:+52...
+    consent_messages: Mapped[bool] = mapped_column(Boolean, default=True)
     appointments = relationship("Appointment", back_populates="patient")
 
 class Appointment(Base):
     __tablename__ = "appointments"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     patient_id: Mapped[int] = mapped_column(Integer, ForeignKey("patients.id"), nullable=False)
-    type: Mapped[str] = mapped_column(String(50), index=True)
+    # <- ahora con default "consulta" y permite NULL en DB por si acaso
+    type: Mapped[Optional[str]] = mapped_column(String(50), index=True, nullable=True, default="consulta")
     start_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     status: Mapped[AppointmentStatus] = mapped_column(Enum(AppointmentStatus), default=AppointmentStatus.reserved)
     channel: Mapped[Channel] = mapped_column(Enum(Channel), default=Channel.whatsapp)
-
     patient = relationship("Patient", back_populates="appointments")
 
 class MessageLog(Base):
     __tablename__ = "message_log"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     direction: Mapped[str] = mapped_column(String(10))  # in/out
     channel: Mapped[str] = mapped_column(String(20))
