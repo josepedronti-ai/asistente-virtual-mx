@@ -1,4 +1,3 @@
-# app/services/nlu.py
 import os, json, re
 from openai import OpenAI
 
@@ -13,11 +12,6 @@ SYSTEM = (
     "Debes devolver EXCLUSIVAMENTE un JSON válido con esta forma exacta:\n"
     '{"intent":"greet|book|reschedule|confirm|cancel|info|smalltalk|fallback",'
     '"entities":{"date":"","time_pref":"","topic":""},"reply":""}\n'
-    "Reglas adicionales:\n"
-    "- Si el usuario menciona una fecha relativa (hoy/mañana/pasado mañana) o un día de la semana, "
-    "  asume intención de reservar (intent=book) y pide la hora si falta.\n"
-    "- Si detectas una hora explícita (hh:mm o h am/pm), también usa intent=book.\n"
-    "- Si el usuario se despide o dice 'no gracias', responde con despedida amable (intent=smalltalk).\n"
     "No incluyas comentarios, texto extra, ni bloques de código. "
     "Si falta información, pídela amablemente. No asumas que ya hay cita."
 )
@@ -26,19 +20,9 @@ API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=API_KEY) if API_KEY else None
 
 _WEEKDAYS = ["lunes","martes","miercoles","miércoles","jueves","viernes","sabado","sábado","domingo"]
-_FAREWELLS = (
-    "no gracias","no, gracias","gracias","muchas gracias","listo","todo bien","está bien",
-    "esta bien","ok gracias","ok, gracias","ya no","ya no gracias","es todo","ninguno","ninguna"
-)
-
-def _has_explicit_time(t: str) -> bool:
-    return bool(
-        re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t) or    # hh:mm
-        re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t)         # h am/pm
-    )
 
 def _enrich_entities(texto: str, entities: dict) -> dict:
-    """Asegura date/time_pref/topic básicos aunque el modelo falle."""
+    """Asegura date/topic básicos; dejamos time_pref vacío (ya no lo usamos)."""
     t = (texto or "").lower().strip()
     ent = {"date":"", "time_pref":"", "topic":""}
     ent.update(entities or {})
@@ -57,21 +41,11 @@ def _enrich_entities(texto: str, entities: dict) -> dict:
                     ent["date"] = wd
                     break
 
-    # time_pref (franja)
-    if not ent.get("time_pref"):
-        if "tarde" in t:
-            ent["time_pref"] = "tarde"
-        elif "noche" in t:
-            ent["time_pref"] = "noche"
-        # Solo marcar "manana" (turno) si se menciona explícitamente la franja
-        elif (" por la mañana" in (" " + t)) or (" en la mañana" in t):
-            ent["time_pref"] = "manana"
-
-    # topic (info)
+    # topic (info) — detectar raíz "ubic"
     if not ent.get("topic"):
         if any(k in t for k in ["costo","costos","precio","precios"]):
             ent["topic"] = "costos"
-        elif any(k in t for k in ["ubicacion","ubicación","direccion","dirección"]):
+        elif re.search(r"\bubic", t) or any(k in t for k in ["direccion","dirección"]):
             ent["topic"] = "ubicacion"
 
     return ent
@@ -79,26 +53,29 @@ def _enrich_entities(texto: str, entities: dict) -> dict:
 def _keyword_router(texto: str) -> dict:
     t = (texto or "").lower().strip()
     if not t:
-        return {"intent":"fallback","entities":{"date":"","time_pref":"","topic":""},"reply":"¿Te apoyo a *programar*, *confirmar* o *reprogramar*?"}
+        return {"intent":"fallback","entities":{},"reply":"¿Te apoyo a *programar*, *confirmar* o *reprogramar*?"}
 
-    # Despedida/smalltalk amable
-    if any(p in t for p in _FAREWELLS):
+    # Smalltalk / despedida rápida
+    if any(x in t for x in ["no gracias","gracias,","muchas gracias","listo","todo bien","está bien","esta bien","ok gracias","no, gracias","gracias"]):
         return {
             "intent":"smalltalk",
-            "entities":{"date":"","time_pref":"","topic":""},
+            "entities":{},
             "reply":"💙 **¡Un gusto ayudarte!**\nCuando lo necesites, aquí estaré para apoyarte."
         }
 
-    # Hora explícita → booking
-    if _has_explicit_time(t):
-        ents = _enrich_entities(texto, {})
-        return {"intent":"book","entities":ents,"reply":"Entendido, ¿para qué **día** es esa hora?"}
+    # “Otros horarios / más tarde / más opciones” → tratar como booking
+    if re.search(r"\b(otro|otra|otros|otras|más|mas)\b.*\b(horario|hora|opcion|opciones|turno|turnos)\b", t):
+        return {"intent":"book","entities":_enrich_entities(texto, {}),"reply":"Claro, te muestro más horarios. ¿De qué **día**?"}
+
+    # Hora explícita → booking (evita irse a 'info')
+    if re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t) or re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t):
+        return {"intent":"book","entities":_enrich_entities(texto, {}),"reply":"Entendido, ¿para qué **día** es esa hora?"}
 
     # Saludo inicial con menú
     if any(k in t for k in ["hola","buenas","menu","menú","buenos días","buenos dias","buenas tardes","buenas noches"]):
         return {
             "intent":"greet",
-            "entities":{"date":"","time_pref":"","topic":""},
+            "entities":{},
             "reply":(
                 "👋 ¡Hola! Soy el asistente del **Dr. Ontiveros** (Cardiólogo intervencionista 🫀).\n"
                 "Cuéntame, ¿en qué puedo apoyarte hoy?\n\n"
@@ -109,36 +86,23 @@ def _keyword_router(texto: str) -> dict:
             )
         }
 
-    # Construye entities base (date/time_pref/topic) desde el texto
+    # Construye entities base (date/topic) desde el texto
     entities = _enrich_entities(texto, {})
 
-    # Si hay fecha clara (aunque no diga "agendar"), intent=book y pedimos hora
-    if entities.get("date"):
-        return {
-            "intent":"book",
-            "entities":entities,
-            "reply":"🕘 ¡Perfecto! Para ese día, ¿qué **hora** te viene mejor?"
-        }
-
-    # Verbos de agenda y demás
-    if any(k in t for k in ["agendar","cita","sacar cita","reservar","programar"]):
-        return {"intent":"book","entities":entities,"reply":"📅 ¡Perfecto! ¿Qué **día** te gustaría?"}
+    # ⚠️ Orden importante: cancelar/reprogramar antes que “cita/agendar”
+    if any(k in t for k in ["cancelar","dar de baja","anular","cancelación","cancelacion"]):
+        return {"intent":"cancel","entities":entities,"reply":"Entendido, puedo cancelarla si existe. ¿Deseas agendar otra fecha?"}
     if any(k in t for k in ["cambiar","reagendar","modificar","mover","reprogramar"]):
         return {"intent":"reschedule","entities":entities,"reply":"Claro, ¿qué **día** te conviene?"}
     if any(k in t for k in ["confirmar","confirmo"]):
         return {"intent":"confirm","entities":entities,"reply":"De acuerdo, intento confirmar tu cita…"}
-    if any(k in t for k in ["cancelar","dar de baja"]):
-        return {"intent":"cancel","entities":entities,"reply":"Entendido, puedo cancelarla si existe. ¿Deseas agendar otra fecha?"}
-    if any(k in t for k in ["costo","precio","costos","precios","ubicacion","ubicación","direccion","dirección","informacion","información","info"]):
+    if any(k in t for k in ["agendar","cita","sacar cita","reservar","programar"]):
+        return {"intent":"book","entities":entities,"reply":"📅 ¡Perfecto! ¿Qué **día** te gustaría?"}
+    if any(k in t for k in ["costo","precio","costos","precios","ubicacion","ubicación","direccion","dirección","informacion","información","info","ubican","ubicados"]):
         entities = _enrich_entities(texto, {"topic": entities.get("topic","")})
-        return {"intent":"info","entities":entities,"reply":"Con gusto, ¿te interesa *costos* o *ubicación*?"}
+        return {"intent":"info","entities":entities,"reply":"Con gusto, ¿te interesa **costos** o **ubicación**?"}
 
-    # Fallback con entities enriquecidas (date/time_pref/topic) por si webhooks puede usarlas
-    return {
-        "intent":"fallback",
-        "entities":entities,
-        "reply":"¿Buscas **programar**, **confirmar/reprogramar** o **información** (costos, ubicación)?"
-    }
+    return {"intent":"fallback","entities":entities,"reply":"¿Buscas **programar**, **confirmar/reprogramar** o **información** (costos, ubicación)?"}
 
 def _extract_json(s: str) -> str:
     if not s:
@@ -185,11 +149,7 @@ def analizar(texto: str) -> dict:
         data["entities"] = _enrich_entities(texto, data.get("entities", {}))
 
         if not data.get("reply"):
-            # Fallback de cortesía
-            if data["intent"] == "book" and data["entities"].get("date"):
-                data["reply"] = "🕘 ¡Perfecto! Para ese día, ¿qué **hora** te viene mejor?"
-            else:
-                data["reply"] = "¿Buscas **programar**, **confirmar/reprogramar** o **información**?"
+            data["reply"] = "¿Buscas **programar**, **confirmar/reprogramar** o **información**?"
         return data
 
     except Exception as e:

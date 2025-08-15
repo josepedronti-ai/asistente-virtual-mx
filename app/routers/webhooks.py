@@ -18,10 +18,9 @@ from ..services.nlu import analizar
 SESSION_CTX: dict[str, dict] = {}
 CTX_TTL_MIN = 15
 
-def set_ctx(contact: str, last_date, time_pref: str | None):
+def set_ctx(contact: str, last_date):
     SESSION_CTX[contact] = {
-        "last_date": last_date,       # date
-        "time_pref": time_pref or "", # "manana"/"tarde"/"noche"
+        "last_date": last_date,  # date
         "ts": datetime.utcnow(),
     }
 
@@ -125,17 +124,6 @@ def parse_time_hint(text: str):
         return int(m.group(1)), 0
     return None
 
-def filter_by_time_pref(slots, time_pref: str):
-    if not time_pref:
-        return slots
-    if time_pref == "manana":
-        return [s for s in slots if 6 <= s.hour < 12]
-    if time_pref == "tarde":
-        return [s for s in slots if 12 <= s.hour < 18]
-    if time_pref == "noche":
-        return [s for s in slots if 18 <= s.hour <= 22]
-    return slots
-
 def human_list(slots, limit=6):
     return "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:limit])
 
@@ -157,7 +145,7 @@ def looks_like_name(text: str) -> str | None:
     clean = " ".join(p.capitalize() for p in parts)
     return clean
 
-# --- Nuevo: extractor propio de fechas en español ---
+# --- Extractor de fechas en español ---
 _WEEK_MAP = {
     "lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2,
     "jueves": 3, "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6
@@ -173,24 +161,16 @@ def extract_spanish_date(text: str, today: date) -> date | None:
     for w, idx in _WEEK_MAP.items():
         if re.search(rf"\b{w}\b", t):
             delta = (idx - today.weekday()) % 7
-            if delta == 0:  # si dice el mismo día de la semana, asumir el siguiente
+            if delta == 0:
                 delta = 7
             return today + timedelta(days=delta)
-    # si logra parsear una fecha explícita en formato libre
     try:
-        dt = dtparser.parse(t, dayfirst=True, fuzzy=True)  # <-- dayfirst True
+        dt = dtparser.parse(t, dayfirst=False, fuzzy=True)
         return dt.date()
     except Exception:
         return None
 
 router = APIRouter(prefix="", tags=["webhooks"])
-
-# Frases de despedida (flexibles)
-FAREWELLS = (
-    "no gracias", "no, gracias", "gracias", "listo", "es todo",
-    "ninguno", "ninguna", "todo bien", "ok gracias", "ok, gracias",
-    "ya no", "ya no gracias"
-)
 
 # ----------------------------
 # Webhook principal
@@ -242,11 +222,6 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         )
         return ""
 
-    # Despedida rápida y amable (frases contenidas)
-    if any(p in text for p in FAREWELLS) or text == "no":
-        send_text(From, "💙 **¡Un gusto ayudarte!**\nCuando lo necesites, aquí estaré para apoyarte.")
-        return ""
-
     # Atajo previo (hora sola + contexto)
     explicit_time_pre = parse_time_hint(raw_text)
     ctx = get_ctx(From)
@@ -260,8 +235,37 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     print(f"[NLU] from={From} intent={intent} entities={entities} text={(raw_text)[:120]}")
 
     nlu_date = entities.get("date") or ""
-    time_pref = entities.get("time_pref") or ""
     topic = entities.get("topic") or ""
+
+    # 2.b) “Otros horarios / más tarde / más opciones”
+    if re.search(r"\b(otro|otra|otros|otras|más|mas)\b.*\b(horario|hora|opcion|opciones|turno|turnos)\b", raw_text.lower()):
+        d = ctx.get("last_date") if ctx else None
+        if d:
+            for db in db_session():
+                slots = available_slots(db, d, settings.TIMEZONE)
+                if not slots:
+                    send_text(
+                        From,
+                        "😔 **Vaya… parece que ese día ya está lleno.**\n"
+                        "Pero no te preocupes 😊, puedo buscarte otros días cercanos para que no tengas que esperar demasiado.\n"
+                        "¿Cuál sería tu **siguiente opción**?"
+                    )
+                    break
+                sample = human_list(slots, limit=10)
+                send_text(
+                    From,
+                    f"🕘 Te comparto **más horarios** del *{d.strftime('%d/%m/%Y')}*:\n{sample}\n"
+                    "¿Cuál te viene mejor?"
+                )
+            return ""
+        # Si no hay fecha en contexto, pedirla
+        send_text(From, "📅 ¿De qué **día** te muestro más horarios?")
+        return ""
+
+    # Farewell rápido
+    if text in ("no", "no gracias", "gracias", "listo", "es todo", "ninguno", "ninguna"):
+        send_text(From, "💙 **¡Un gusto ayudarte!**\nCuando lo necesites, aquí estaré para apoyarte.")
+        return ""
 
     # 3) Info general
     if intent == "info" and not explicit_time_pre:
@@ -285,7 +289,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 "**CLIEMED**, Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L. 🚗"
             )
             return ""
-        send_text(From, reply or "¿Te interesa *costos* o *ubicación*?")
+        send_text(From, "Con gusto, ¿te interesa **costos** o **ubicación**?")
         return ""
 
     # 4) Confirmar
@@ -301,7 +305,6 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 break
             appt.status = models.AppointmentStatus.confirmed
             db.commit()
-            SESSION_CTX.pop(From, None)  # limpia contexto al confirmar
             name_txt = f" de *{patient.name}*" if patient and patient.name else ""
             send_text(From, f"✅ Tu cita{name_txt} quedó confirmada para {appt.start_at.strftime('%d/%m/%Y a las %H:%M')}.\n💬 **¿Te ayudo en algo más?**")
         return ""
@@ -315,7 +318,6 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 break
             appt.status = models.AppointmentStatus.canceled
             db.commit()
-            SESSION_CTX.pop(From, None)  # limpia contexto al cancelar
             send_text(From, "🗓️ He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios.")
         return ""
 
@@ -336,8 +338,6 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         explicit_time = parse_time_hint(raw_text)
         if not parsed_date and explicit_time and ctx and ctx.get("last_date"):
             parsed_date = ctx["last_date"]
-            if not time_pref:
-                time_pref = ctx.get("time_pref", "")
 
         # Caso A: fecha SÍ, hora NO -> pedir hora y guardar contexto
         if parsed_date and not explicit_time:
@@ -351,9 +351,8 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         "¿Cuál sería tu **siguiente opción**?"
                     )
                     break
-                filt = filter_by_time_pref(slots, time_pref) or slots
-                sample = human_list(filt, limit=6)
-                set_ctx(From, parsed_date, time_pref)
+                sample = human_list(slots, limit=6)
+                set_ctx(From, parsed_date)
                 send_text(
                     From,
                     f"🕘 Estos son algunos horarios disponibles el *{parsed_date.strftime('%d/%m/%Y')}*:\n{sample}\n"
@@ -403,7 +402,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         key=lambda x: abs((x.hour*60 + x.minute) - (target_h*60 + target_m))
                     )
                     sample = human_list(sorted_by_diff, limit=6)
-                    set_ctx(From, parsed_date, time_pref)
+                    set_ctx(From, parsed_date)
                     send_text(
                         From,
                         "⏰ **Esa hora ya no está libre**, pero encontré estos horarios cercanos que podrían servirte:\n"
@@ -424,7 +423,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
 
     # 8) Parser natural (último recurso)
     try:
-        dt = dtparser.parse(text, dayfirst=True, fuzzy=True)  # <-- dayfirst True
+        dt = dtparser.parse(text, dayfirst=False, fuzzy=True)
         d = dt.date()
         lowered = text.lower()
         has_time_hint = (":" in lowered) or (" am" in lowered) or (" pm" in lowered)
@@ -460,7 +459,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         )
                 else:
                     sample = human_list(slots, limit=6)
-                    set_ctx(From, d, "")
+                    set_ctx(From, d)
                     send_text(
                         From,
                         "⏰ **Esa hora ya no está libre**, pero encontré estos horarios cercanos que podrían servirte:\n"
@@ -469,7 +468,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     )
             else:
                 sample = human_list(slots, limit=6)
-                set_ctx(From, d, "")
+                set_ctx(From, d)
                 send_text(
                     From,
                     "🕘 Estos son algunos horarios que tengo:\n" + sample +
