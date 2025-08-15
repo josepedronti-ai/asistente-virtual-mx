@@ -14,4 +14,7 @@ class Settings(BaseSettings):
     TWILIO_WHATSAPP_FROM: str | None = None
     TWILIO_TEST_TO: str | None = None
 
+    # Nuevo interruptor para pruebas sin enviar mensajes reales
+    DRY_RUN: bool = False
+
 settings = Settings()
