@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Form
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
-from datetime import timedelta
+from datetime import datetime, timedelta
 from dateutil import parser as dtparser
 import unicodedata
+from collections import defaultdict
 
 from ..database import SessionLocal
 from ..config import settings
@@ -12,6 +13,10 @@ from ..services.notifications import send_text
 from ..services.scheduling import available_slots
 from ..services.nlu import analizar
 
+
+# ----------------------------
+# Utilidades
+# ----------------------------
 def normalize(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFD", s)
@@ -37,6 +42,51 @@ def find_latest_reserved_for_contact(db: Session, contact: str):
         .first()
     )
 
+# ----------------------------
+# Contexto en memoria (simple para piloto)
+# Guarda fecha ofrecida y últimos slots listados por contacto
+# ----------------------------
+CONTEXT = defaultdict(dict)
+
+def get_or_create_patient(db: Session, contact: str) -> models.Patient:
+    p = db.query(models.Patient).filter(models.Patient.contact == contact).first()
+    if p:
+        return p
+    p = models.Patient(name=None, contact=contact)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return p
+
+def reserve_appointment(db: Session, contact: str, start_dt: datetime) -> models.Appointment:
+    """Crea o actualiza la cita más reciente de este contacto como 'reserved' con start_dt."""
+    patient = get_or_create_patient(db, contact)
+    appt = (
+        db.query(models.Appointment)
+        .join(models.Patient)
+        .filter(models.Patient.id == patient.id)
+        .filter(models.Appointment.status != models.AppointmentStatus.canceled)
+        .order_by(models.Appointment.start_at.desc())
+        .first()
+    )
+    if appt is None:
+        appt = models.Appointment(
+            patient_id=patient.id,
+            start_at=start_dt,
+            status=models.AppointmentStatus.reserved,
+        )
+        db.add(appt)
+    else:
+        appt.start_at = start_dt
+        appt.status = models.AppointmentStatus.reserved
+    db.commit()
+    db.refresh(appt)
+    return appt
+
+
+# ----------------------------
+# Webhook WhatsApp
+# ----------------------------
 @router.post("/webhooks/whatsapp", response_class=PlainTextResponse)
 async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     if not From:
@@ -80,13 +130,13 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     # ----------------------------
     if intent == "info":
         if topic in ("costos", "costo", "precio", "precios"):
-            send_text(From, "Con gusto. Los costos varían según el tipo de consulta. ¿Qué consulta te interesa?")
+            send_text(From, "Con gusto. Los costos varían según el tipo de consulta. ¿Te interesa consulta inicial o de seguimiento?")
             return ""
         if topic in ("ubicacion", "direccion"):
-            send_text(From, "Estamos en Clínica ABC, Av. Ejemplo 123, León, Gto. Hay estacionamiento en sitio 🚗.")
+            send_text(From, "📍 Estamos en Clínica ABC, Av. Ejemplo 123, León, Gto. Hay estacionamiento en sitio 🚗.")
             return ""
         if topic in ("preparacion",):
-            send_text(From, "Preparación general: llega 10 min antes, trae identificación y estudios previos si los tienes.")
+            send_text(From, "Recomendación general: llega 10 min antes, lleva identificación y estudios previos si los tienes.")
             return ""
         send_text(From, reply or "¿Te interesa costos, ubicación o preparación?")
         return ""
@@ -103,7 +153,12 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     if not slots:
                         send_text(From, "No veo horarios ese día. ¿Otro día u otro turno (mañana/tarde)?")
                         break
-                    sample = "\n".join(s.isoformat() for s in slots[:6])
+
+                    # Guarda contexto para entender la hora que elija el paciente
+                    CONTEXT[From]["pending_date"] = d
+                    CONTEXT[From]["last_slots"] = slots
+
+                    sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
                     send_text(
                         From,
                         "Estos son algunos horarios que tengo:\n" + sample +
@@ -114,7 +169,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             except Exception:
                 pass
         # Sin fecha clara → pídela de forma natural
-        send_text(From, reply or "Perfecto. ¿Qué día te gustaría? Puedes decirlo con tus palabras (p. ej., '15 de agosto por la tarde').")
+        send_text(From, reply or "¿Qué día te gustaría?")
         return ""
 
     # ----------------------------
@@ -128,7 +183,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 break
             appt.status = models.AppointmentStatus.confirmed
             db.commit()
-            send_text(From, f"✅ Confirmé tu cita para {appt.start_at.isoformat()}. ¿Algo más en lo que te ayude?")
+            send_text(From, f"✅ Tu cita quedó confirmada para {appt.start_at.strftime('%d/%m/%Y %H:%M')}. ¿Algo más en lo que te ayude?")
         return ""
 
     # ----------------------------
@@ -142,7 +197,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 break
             appt.status = models.AppointmentStatus.canceled
             db.commit()
-            send_text(From, "🗑️ He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios.")
+            send_text(From, "He cancelado tu cita. Si quieres, puedo proponerte nuevos horarios.")
         return ""
 
     # ----------------------------
@@ -155,9 +210,10 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
 
     # ----------------------------
     # Parser de fecha y hora naturales (ej. “15 de agosto 10:30 am”)
+    # - Si el usuario responde solo con la hora, reservamos en BD
     # ----------------------------
     try:
-        # Detecta fecha y, si viene, hora
+        # Detecta fecha y (si viene) hora
         dt = dtparser.parse(text, dayfirst=False, fuzzy=True)
         d = dt.date()
 
@@ -167,36 +223,49 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 send_text(From, "No veo horarios ese día. ¿Quieres intentar con otro día u otro turno (mañana/tarde)?")
                 break
 
-            lowered = text.lower()
+            lowered = raw_text.lower()
             has_time_hint = (":" in lowered) or (" am" in lowered) or (" pm" in lowered)
 
             if has_time_hint:
+                # 1) Fecha base (de contexto si existe)
+                base_date = CONTEXT[From].get("pending_date", d)
+
+                # 2) Hora elegida
                 target_h = dt.hour
                 target_m = dt.minute
+
+                # 3) Buscar match exacto en los últimos slots ofrecidos (o en los actuales)
+                last_slots = CONTEXT[From].get("last_slots") or slots
                 match = None
-                for s in slots:
-                    if s.hour == target_h and s.minute == target_m:
+                for s in last_slots:
+                    if s.date() == base_date and s.hour == target_h and s.minute == target_m:
                         match = s
                         break
+
                 if match:
-                    # Aquí solo proponemos el slot elegido; la creación/reserva real puede hacerse en tu flujo de DB
+                    # ⚠️ Reservar en BD para que 'confirmar' funcione
+                    reserve_appointment(db, From, match)
+
                     send_text(
                         From,
-                        f"📌 Excelente, tengo {match.isoformat()} disponible. "
-                        "Escribe *confirmar* para confirmar o *cambiar* para ver otras opciones."
+                        f"📌 Excelente, tengo {match.strftime('%d/%m/%Y %H:%M')} reservado para ti.\n"
+                        "Escribe *confirmar* para confirmar o *cambiar* si necesitas otra opción."
                     )
-                    break
+                    return ""
                 else:
-                    sample = "\n".join(s.isoformat() for s in slots[:6])
+                    sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in last_slots[:6])
                     send_text(
                         From,
                         "No tengo exactamente esa hora, pero cuento con:\n" + sample +
-                        "\nResponde con la *hora exacta* que prefieras (ej. 10:30), o escribe *cambiar* para más opciones."
+                        "\nResponde con la *hora exacta* (ej. 10:30) o escribe *cambiar* para más opciones."
                     )
-                    break
+                    return ""
             else:
-                # Solo fecha → listamos opciones
-                sample = "\n".join(s.isoformat() for s in slots[:6])
+                # Solo fecha → listamos opciones y guardamos contexto
+                CONTEXT[From]["pending_date"] = d
+                CONTEXT[From]["last_slots"] = slots
+
+                sample = "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:6])
                 send_text(
                     From,
                     "Estos son algunos horarios que tengo:\n" + sample +
