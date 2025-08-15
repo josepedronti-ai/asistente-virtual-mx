@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from dateutil import parser as dtparser
 import unicodedata
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ..database import SessionLocal
 from ..config import settings
@@ -12,7 +12,6 @@ from .. import models
 from ..services.notifications import send_text
 from ..services.scheduling import available_slots
 from ..services.nlu import analizar
-
 
 # ----------------------------
 # Utilidades
@@ -40,18 +39,19 @@ def find_latest_reserved_for_contact(db: Session, contact: str):
         .first()
     )
 
+# ✅ Punto 2: crear/obtener paciente de forma segura
 def get_or_create_patient(db: Session, contact: str) -> models.Patient:
     p = db.query(models.Patient).filter(models.Patient.contact == contact).first()
     if p:
         return p
-    p = models.Patient(contact=contact)  # nombre se puede pedir luego
+    p = models.Patient(contact=contact)  # name tiene default="Paciente" en el modelo
     db.add(p)
     db.commit()
     db.refresh(p)
     return p
 
+# ✅ Punto 3: reservar o actualizar una cita "reserved"
 def reserve_or_update(db: Session, patient: models.Patient, start_dt: datetime) -> models.Appointment:
-    # Si ya hay una reservada reciente, la movemos; si no, creamos nueva.
     appt = (
         db.query(models.Appointment)
         .filter(models.Appointment.patient_id == patient.id)
@@ -65,7 +65,9 @@ def reserve_or_update(db: Session, patient: models.Patient, start_dt: datetime) 
         appt = models.Appointment(
             patient_id=patient.id,
             start_at=start_dt,
-            status=models.AppointmentStatus.reserved
+            status=models.AppointmentStatus.reserved,
+            channel=models.Channel.whatsapp,
+            type="consulta",
         )
         db.add(appt)
     db.commit()
@@ -77,7 +79,7 @@ def parse_time_hint(text: str):
     Extrae una hora explícita del texto (ej: '10:30', '4 pm', '16:00').
     Devuelve (hour, minute) o None.
     """
-    t = text.lower().strip()
+    t = (text or "").lower().strip()
     # hh:mm
     m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t)
     if m:
@@ -92,11 +94,10 @@ def parse_time_hint(text: str):
         if ampm == "am" and h == 12:
             h = 0
         return h, 0
-    # hh (solo hora en 24h), muy conservador para evitar falsos positivos
+    # hh (24h) conservador
     m = re.search(r"\b(0?\d|1\d|2[0-3])\s*h?\b", t)
     if m:
-        h = int(m.group(1))
-        return h, 0
+        return int(m.group(1)), 0
     return None
 
 def filter_by_time_pref(slots, time_pref: str):
@@ -113,9 +114,27 @@ def filter_by_time_pref(slots, time_pref: str):
 def human_list(slots, limit=6):
     return "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in slots[:limit])
 
+def resolve_relative_date(nlu_date: str):
+    """
+    Convierte 'hoy', 'mañana', 'pasado mañana' a fecha.
+    Si no coincide, intenta parsear con dateutil.
+    """
+    if not nlu_date:
+        return None
+    t = normalize(nlu_date)
+    today = datetime.now().date()
+    if t == "hoy":
+        return today
+    if t == "manana":
+        return today + timedelta(days=1)
+    if t in ("pasado manana", "pasado-manana", "pasadomanana"):
+        return today + timedelta(days=2)
+    try:
+        return dtparser.parse(nlu_date, dayfirst=False, fuzzy=True).date()
+    except Exception:
+        return None
 
 router = APIRouter(prefix="", tags=["webhooks"])
-
 
 # ----------------------------
 # Webhook principal
@@ -150,7 +169,8 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
 
     print(f"[NLU] from={From} intent={intent} entities={entities} text={(raw_text)[:120]}")
 
-    nlu_date = entities.get("date") or ""
+    nlu_date_raw = entities.get("date") or ""
+    parsed_date = resolve_relative_date(nlu_date_raw)
     time_pref = entities.get("time_pref") or ""   # "manana"/"tarde"/"noche"
     topic = entities.get("topic") or ""
 
@@ -194,29 +214,16 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
 
     # 6) Agendar / Reprogramar con lógica robusta fecha/hora
     if intent in ("book", "reschedule"):
-        # 6.1: ¿Trae hora explícita?
         explicit_time = parse_time_hint(raw_text)  # (h,m) o None
 
-        # 6.2: ¿Tenemos fecha clara?
-        # nlu_date puede ser 'mañana', 'hoy', '2025-08-15', etc.
-        parsed_date = None
-        if nlu_date:
-            try:
-                parsed_date = dtparser.parse(nlu_date, dayfirst=False, fuzzy=True).date()
-            except Exception:
-                parsed_date = None
-
-        # Caso A: fecha SÍ, hora NO -> pedir hora (y sugerir slots del turno)
+        # Caso A: fecha SÍ, hora NO -> pedir hora (filtrando por turno si viene)
         if parsed_date and not explicit_time:
             for db in db_session():
                 slots = available_slots(db, parsed_date, settings.TIMEZONE)
                 if not slots:
                     send_text(From, "No veo horarios ese día. ¿Prefieres otro día u otro turno (mañana/tarde)?")
                     break
-                # Filtramos por preferencia de turno si viene
-                filt = filter_by_time_pref(slots, time_pref)
-                if not filt:
-                    filt = slots
+                filt = filter_by_time_pref(slots, time_pref) or slots
                 sample = human_list(filt, limit=6)
                 pref_txt = " por la mañana" if time_pref == "manana" else (" por la tarde" if time_pref == "tarde" else (" por la noche" if time_pref == "noche" else ""))
                 send_text(
@@ -231,7 +238,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             send_text(From, "Perfecto. ¿Qué *día* te gustaría?")
             return ""
 
-        # Caso C: fecha SÍ y hora SÍ -> intentamos reservar ese slot
+        # Caso C: fecha SÍ y hora SÍ -> intentar reservar ese slot
         if parsed_date and explicit_time:
             target_h, target_m = explicit_time
             for db in db_session():
@@ -253,8 +260,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         "Escribe *confirmar* para confirmar o *cambiar* si prefieres otra hora."
                     )
                 else:
-                    # No exacto → sugerimos cercanos
-                    # Ordenados por |hora - target|
+                    # Sugerir cercanos ordenados por diferencia de minutos
                     sorted_by_diff = sorted(
                         slots,
                         key=lambda x: abs((x.hour*60 + x.minute) - (target_h*60 + target_m))
@@ -267,7 +273,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     )
             return ""
 
-        # Caso D: no hay suficiente info → pedir mínimo la fecha
+        # Caso D: sin suficiente info
         send_text(From, reply or "¿Qué día te gustaría?")
         return ""
 
@@ -277,11 +283,10 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             send_text(From, reply)
             return ""
 
-    # 8) Parser natural de fecha/hora como último recurso
+    # 8) Parser natural de fecha/hora como último recurso (mensaje suelto)
     try:
         dt = dtparser.parse(text, dayfirst=False, fuzzy=True)
         d = dt.date()
-        # ¿El usuario escribió hora? (para proponer exacto o cercanos)
         lowered = text.lower()
         has_time_hint = (":" in lowered) or (" am" in lowered) or (" pm" in lowered)
         for db in db_session():
@@ -306,7 +311,12 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         "Escribe *confirmar* para confirmar o *cambiar* si prefieres otra hora."
                     )
                 else:
-                    sample = human_list(slots, limit=6)
+                    # cercanos
+                    sorted_by_diff = sorted(
+                        slots,
+                        key=lambda x: abs((x.hour*60 + x.minute) - (target_h*60 + target_m))
+                    )
+                    sample = human_list(sorted_by_diff, limit=6)
                     send_text(
                         From,
                         "No tengo exactamente esa hora, pero cuento con:\n" + sample +
