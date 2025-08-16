@@ -169,7 +169,7 @@ def extract_spanish_date(text: str, today: date) -> date | None:
     if "pasado mañana" in t: return today + timedelta(days=2)
     if "mañana" in t: return today + timedelta(days=1)
     if "hoy" in t: return today
-    for w, idx in _ WEEK_MAP.items():
+    for w, idx in _WEEK_MAP.items():
         if re.search(rf"\b{w}\b", t):
             delta = (idx - today.weekday()) % 7
             if delta == 0: delta = 7
