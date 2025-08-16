@@ -1,36 +1,33 @@
 # app/services/nlu.py
 import os, json, re
-from openai import OpenAI
+from typing import Dict
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # para entornos sin lib instalada
 
 # Marca de build (útil para verificar qué versión corre en Render)
-NLU_BUILD = "nlu-2025-08-15-r2"
+NLU_BUILD = "nlu-2025-08-15-r3"
 
 INTENTS = ["greet","book","reschedule","confirm","cancel","info","smalltalk","fallback"]
 
+# Sistema minimalista: SOLO devuelve JSON (sin tono/estilo)
 SYSTEM = (
-    "Eres el asistente del Dr. Ontiveros (Cardiólogo intervencionista). "
-    "Objetivo: ayudar a agendar, reprogramar, confirmar o cancelar citas, y dar información de costos/ubicación. "
-    "Habla con tono humano, cálido y profesional; sé breve y claro; usa negritas moderadas y 1 emoji cuando aporte calidez. "
-    "Reglas de diálogo: pide solo lo necesario, en orden: primero fecha, luego hora, luego nombre. "
-    "Si algo falta, pregunta de forma amable. Si el usuario dice 'no gracias' o equivalente, cierra con una despedida amable. "
-    "No asumas que ya existe una cita.\n"
-    "\n"
-    "DEVUELVE EXCLUSIVAMENTE un JSON válido con esta forma exacta (sin texto extra):\n"
+    "Eres un parser NLU para WhatsApp del consultorio del Dr. Ontiveros. "
+    "Objetivo: clasificar INTENT y extraer ENTITIES. "
+    "NO redactes respuestas; solo estructura. "
+    "INTENTS permitidos: greet, book, reschedule, confirm, cancel, info, smalltalk, fallback. "
+    "ENTITIES: {date, time, time_pref, name, topic}. "
+    "Devuelve EXCLUSIVAMENTE JSON válido con la forma exacta:\n"
     "{"
     "\"intent\":\"greet|book|reschedule|confirm|cancel|info|smalltalk|fallback\","
-    "\"entities\":{"
-      "\"date\":\"\","
-      "\"time\":\"\","
-      "\"time_pref\":\"\","
-      "\"name\":\"\","
-      "\"topic\":\"\""
-    "},"
+    "\"entities\":{\"date\":\"\",\"time\":\"\",\"time_pref\":\"\",\"name\":\"\",\"topic\":\"\"},"
     "\"reply\":\"\""
     "}"
 )
 
 API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=API_KEY) if API_KEY else None
+client = OpenAI(api_key=API_KEY) if (API_KEY and OpenAI) else None
 
 _WEEKDAYS = ["lunes","martes","miercoles","miércoles","jueves","viernes","sabado","sábado","domingo"]
 
@@ -41,14 +38,13 @@ _FAREWELLS = [
 
 def _enrich_entities(texto: str, entities: dict) -> dict:
     """
-    Asegura siempre las llaves esperadas y trata de rellenar date/time_pref/topic
-    si el modelo no lo hizo. 'time' y 'name' se respetan si vienen, si no quedan vacíos.
+    Asegura llaves esperadas y rellena date/time_pref/topic si el modelo no lo hizo.
     """
     t = (texto or "").lower().strip()
     ent = {"date":"", "time":"", "time_pref":"", "name":"", "topic":""}
     ent.update(entities or {})
 
-    # date (relativas y días)
+    # date (relativas y días semana)
     if not ent.get("date"):
         if "pasado mañana" in t:
             ent["date"] = "pasado mañana"
@@ -62,7 +58,7 @@ def _enrich_entities(texto: str, entities: dict) -> dict:
                     ent["date"] = wd
                     break
 
-    # time_pref (franja) - opcional, ya no la usamos para filtrar, pero la dejamos si el modelo la aporta
+    # time_pref (franja, opcional)
     if not ent.get("time_pref"):
         if "tarde" in t:
             ent["time_pref"] = "tarde"
@@ -80,54 +76,43 @@ def _enrich_entities(texto: str, entities: dict) -> dict:
 
     return ent
 
-def _keyword_router(texto: str) -> dict:
+def _keyword_router(texto: str) -> Dict:
+    """
+    Router rápido/determinista sin OpenAI (o como primera pasada).
+    Devuelve intent + entities, con reply siempre vacío (lo redacta replygen).
+    """
     t = (texto or "").lower().strip()
     if not t:
-        return {"intent":"fallback","entities":{},"reply":"¿Te apoyo a *programar*, *confirmar* o *reprogramar*?"}
+        return {"intent":"fallback","entities":{},"reply":""}
 
     # Smalltalk / despedida rápida
     if any(x in t for x in _FAREWELLS):
-        return {
-            "intent":"smalltalk",
-            "entities":{},
-            "reply":"💙 **¡Un gusto ayudarte!**\nCuando lo necesites, aquí estaré para apoyarte."
-        }
+        return {"intent":"smalltalk","entities":{},"reply":""}
 
-    # Hora explícita → tráelo a booking (evita irse a 'info')
+    # Hora explícita → booking
     if re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t) or re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t):
-        return {"intent":"book","entities":_enrich_entities(texto, {}),"reply":"Entendido, ¿para qué **día** es esa hora?"}
+        return {"intent":"book","entities":_enrich_entities(texto, {}),"reply":""}
 
-    # Saludo inicial con menú
+    # Saludo inicial
     if any(k in t for k in ["hola","buenas","menu","menú","buenos días","buenos dias","buenas tardes","buenas noches"]):
-        return {
-            "intent":"greet",
-            "entities":{},
-            "reply":(
-                "👋 ¡Hola! Soy el asistente del **Dr. Ontiveros** (Cardiólogo intervencionista 🫀).\n"
-                "Cuéntame, ¿en qué puedo apoyarte hoy?\n\n"
-                "• 📅 **Agendar** una cita\n"
-                "• 🔄 **Confirmar** o **reprogramar**\n"
-                "• 💳 **Costos** y 📍 **ubicación**\n"
-                "• ❓ **Otras dudas** o información general."
-            )
-        }
+        return {"intent":"greet","entities":{},"reply":""}
 
-    # Construye entities base (date/time_pref/topic) desde el texto
+    # Construye entities base (date/time_pref/topic)
     entities = _enrich_entities(texto, {})
 
     if any(k in t for k in ["agendar","cita","sacar cita","reservar","programar"]):
-        return {"intent":"book","entities":entities,"reply":"📅 ¡Perfecto! ¿Qué **día** te gustaría?"}
+        return {"intent":"book","entities":entities,"reply":""}
     if any(k in t for k in ["cambiar","reagendar","modificar","mover","reprogramar"]):
-        return {"intent":"reschedule","entities":entities,"reply":"Claro, ¿qué **día** te conviene?"}
+        return {"intent":"reschedule","entities":entities,"reply":""}
     if any(k in t for k in ["confirmar","confirmo"]):
-        return {"intent":"confirm","entities":entities,"reply":"De acuerdo, intento confirmar tu cita…"}
+        return {"intent":"confirm","entities":entities,"reply":""}
     if any(k in t for k in ["cancelar","dar de baja"]):
-        return {"intent":"cancel","entities":entities,"reply":"Entendido, puedo cancelarla si existe. ¿Deseas agendar otra fecha?"}
+        return {"intent":"cancel","entities":entities,"reply":""}
     if any(k in t for k in ["costo","precio","costos","precios","ubicacion","ubicación","direccion","dirección","informacion","información","info"]):
         entities = _enrich_entities(texto, {"topic": entities.get("topic","")})
-        return {"intent":"info","entities":entities,"reply":"Con gusto, ¿te interesa *costos* o *ubicación*?"}
+        return {"intent":"info","entities":entities,"reply":""}
 
-    return {"intent":"fallback","entities":entities,"reply":"¿Buscas **programar**, **confirmar/reprogramar** o **información** (costos, ubicación)?"}
+    return {"intent":"fallback","entities":entities,"reply":""}
 
 def _extract_json(s: str) -> str:
     if not s:
@@ -139,16 +124,17 @@ def _extract_json(s: str) -> str:
     return m.group(0) if m else "{}"
 
 def analizar(texto: str) -> dict:
-    # 1) Router económico primero
+    """
+    1) Intent/entidades por router de palabras clave (rápido).
+    2) Si hay OPENAI_API_KEY y sigue en fallback, llama al modelo para refinar.
+    """
     kw = _keyword_router(texto)
     if kw["intent"] != "fallback":
         return kw
 
-    # 2) Si no hay API, nos quedamos con lo anterior
     if not client:
         return kw
 
-    # 3) Llamada a modelo con JSON forzado
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -170,11 +156,10 @@ def analizar(texto: str) -> dict:
         if "entities" not in data or not isinstance(data["entities"], dict):
             data["entities"] = {}
 
-        # Post-procesado seguro de entidades
+        # Normalizamos entidades de forma segura
         data["entities"] = _enrich_entities(texto, data.get("entities", {}))
-
-        if not data.get("reply"):
-            data["reply"] = "¿Buscas **programar**, **confirmar/reprogramar** o **información**?"
+        # reply se mantiene vacío; la redacción la hace replygen
+        data["reply"] = ""
         return data
 
     except Exception as e:
@@ -182,5 +167,6 @@ def analizar(texto: str) -> dict:
         return kw
 
 def analizar_mensaje(texto: str) -> str:
+    # Solo para compatibilidad; ya no usamos replies aquí.
     out = analizar(texto)
-    return out.get("reply","¿Te ayudo a *programar*, *confirmar* o *reprogramar*?")
+    return out.get("reply","")
