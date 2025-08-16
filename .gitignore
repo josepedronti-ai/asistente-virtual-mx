@@ -3,3 +3,7 @@
 __pycache__/
 *.db
 .DS_Store
+.env
+app/credentials/
+__pycache__/
+*.db

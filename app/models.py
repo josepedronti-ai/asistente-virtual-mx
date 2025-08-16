@@ -21,7 +21,7 @@ class AppointmentStatus(str, enum.Enum):
 class Patient(Base):
     __tablename__ = "patients"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    # <- ahora nombre puede ser NULL; lo pediremos luego en el flujo
+    # nombre puede ser NULL; lo pedimos después en el flujo
     name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, default=None, index=True)
     contact: Mapped[str] = mapped_column(String(120), index=True)  # whatsapp:+52...
     consent_messages: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -31,11 +31,14 @@ class Appointment(Base):
     __tablename__ = "appointments"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     patient_id: Mapped[int] = mapped_column(Integer, ForeignKey("patients.id"), nullable=False)
-    # <- ahora con default "consulta" y permite NULL en DB por si acaso
+    # default "consulta" y permite NULL en DB por si acaso
     type: Mapped[Optional[str]] = mapped_column(String(50), index=True, nullable=True, default="consulta")
     start_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     status: Mapped[AppointmentStatus] = mapped_column(Enum(AppointmentStatus), default=AppointmentStatus.reserved)
     channel: Mapped[Channel] = mapped_column(Enum(Channel), default=Channel.whatsapp)
+    # 🔹 id del evento en Google Calendar (si ya se confirmó/creó)
+    event_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, index=True)
+
     patient = relationship("Patient", back_populates="appointments")
 
 class MessageLog(Base):

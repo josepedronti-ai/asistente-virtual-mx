@@ -182,3 +182,39 @@ def delete_event(event_id: str):
     except Exception:
         # Si ya no existe, lo ignoramos para que sea idempotente
         pass
+
+if __name__ == "__main__":
+    import traceback
+    from datetime import date
+
+    print(f"=== Diagnóstico Google Calendar ===")
+    try:
+        # Confirmar carga de settings
+        print(f"TIMEZONE: {TIMEZONE}")
+        print(f"GCAL_CALENDAR_ID: {CALENDAR_ID}")
+
+        # Probar credenciales y servicio
+        svc = _get_service()
+        cal = svc.calendars().get(calendarId=CALENDAR_ID).execute()
+        print(f"Conectado a calendario: {cal.get('summary', '(sin summary)')}")
+
+        # Probar free/busy y slots para hoy y próximos 2 días
+        today = date.today()
+        for offset in range(0, 3):
+            d = today + timedelta(days=offset)
+            print(f"\n=== Slots para {d.isoformat()} | TZ={TIMEZONE} ===")
+            try:
+                slots = available_slots(None, d, TIMEZONE)
+                if not slots:
+                    print("(Sin disponibilidad o fuera de horario)")
+                else:
+                    for s in slots:
+                        print(s.strftime("%H:%M"))
+            except Exception as e:
+                print(f"ERROR al consultar slots: {e}")
+                traceback.print_exc()
+
+        print("\n✅ Prueba terminada.")
+    except Exception as e:
+        print(f"❌ Error general al inicializar o consultar Calendar: {e}")
+        traceback.print_exc()
