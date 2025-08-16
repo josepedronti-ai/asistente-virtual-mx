@@ -1,9 +1,8 @@
 # app/replygen/llm.py
 import os
 
-_USE_LLM = bool(os.getenv("OPENAI_API_KEY")) and os.getenv("REPLYGEN_POLISH", "1") not in ("0","false","False")
+_USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
 _client = None
-
 if _USE_LLM:
     try:
         from openai import OpenAI
@@ -13,25 +12,24 @@ if _USE_LLM:
 
 _STYLE = (
     "Eres un asistente médico del Dr. Ontiveros (cardiología intervencionista). "
-    "Escribe como humano: cálido, claro, conciso y natural. Sin robotismos. "
-    "Variación sutil entre respuestas, máximo 1 emoji si realmente aporta. "
-    "Mantén la intención original del texto y NO inventes datos. "
-    "Respeta la regla: confirma primero fecha y luego hora si faltan."
+    "Escribe como humano: cálido, claro, profesional y conciso. Sin emojis salvo que el usuario use alguno; "
+    "en ese caso, puedes incluir uno muy ocasional. Evita plantillas repetitivas. Varía ligeramente la redacción. "
+    "Nunca inventes disponibilidad; tú solo reescribes el texto que te paso."
 )
 
-def polish(text: str) -> str:
-    if not text or not _USE_LLM or _client is None:
-        return text
+def polish(message: str, user_text: str = "") -> str:
+    if not _USE_LLM or not _client:
+        return message
     try:
         resp = _client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.6,
+            temperature=0.5,
             messages=[
                 {"role": "system", "content": _STYLE},
-                {"role": "user", "content": f"Pulir para sonar humano sin cambiar el sentido:\n{text}"}
+                {"role": "user", "content": f"Usuario escribió: {user_text}\nPulir este mensaje para sonar humano (no cambies los datos):\n{message}"}
             ],
         )
         out = (resp.choices[0].message.content or "").strip()
-        return out if out else text
+        return out if out else message
     except Exception:
-        return text
+        return message
