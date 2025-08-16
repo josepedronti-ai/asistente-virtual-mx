@@ -1,8 +1,7 @@
 # app/replygen/core.py
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, date as date_cls
 from typing import Any, Dict, Optional
-from .llm import polish
 
 def _stable_pick(options: list[str], seed: str) -> str:
     if not options:
@@ -11,139 +10,137 @@ def _stable_pick(options: list[str], seed: str) -> str:
     return options[idx]
 
 def _fmt_dt(dt: Optional[datetime]) -> str:
-    return dt.strftime("%d/%m/%Y %H:%M") if isinstance(dt, datetime) else ""
-
-def _fmt_date(dt: Optional[datetime]) -> str:
-    return dt.strftime("%d/%m/%Y") if isinstance(dt, datetime) else ""
-
-def _spread_slots_text(slots: list[datetime], limit: int = 12) -> str:
-    """Distribuye horarios a lo largo del día para que no salgan puros de mañana."""
-    if not slots:
+    if not isinstance(dt, datetime):
         return ""
-    if len(slots) <= limit:
-        sel = slots
-    else:
-        step = max(1, len(slots)//limit)
-        sel = [slots[i] for i in range(0, len(slots), step)][:limit]
-    return "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in sel)
+    return dt.strftime("%d/%m/%Y %H:%M")
 
-# ---- Intents ----
+def _fmt_date(d: Optional[datetime | date_cls]) -> str:
+    if isinstance(d, datetime):
+        return d.strftime("%d/%m/%Y")
+    if isinstance(d, date_cls):
+        return d.strftime("%d/%m/%Y")
+    return ""
 
-def _ask_confirm_after_name(state: Dict[str, Any], seed: str) -> str:
-    appt_dt = state.get("appt_dt")
-    patient_name = (state.get("patient_name") or "").strip()
-    when = _fmt_dt(appt_dt) or "la fecha reservada"
-    saludo = _stable_pick(["", "Gracias.", "Perfecto.", "Gracias por el dato."], seed)
-    nombre = f"{patient_name}, " if patient_name else ""
-    l2 = _stable_pick(
-        [f"¿La dejamos confirmada para {when} o prefieres moverla?",
-         f"¿Confirmamos {when} o quieres cambiarla?",
-         f"¿Te parece mantener {when} o buscamos otro horario?"],
-        seed + "l2"
-    )
-    base = f"{saludo} {nombre}{l2}".strip()
-    return polish(base, state.get("user_text",""))
+# ========= plantillas (tono MX, cálido, natural, sin emojis) =========
+
+def _greet(state: Dict[str, Any], seed: str) -> str:
+    nombre = (state.get("patient_name") or "").strip()
+    inicio = _stable_pick(["Hola", "Buen día", "¿Qué tal"], seed)
+    base = [
+        f"{inicio}{' ' + nombre if nombre else ''}. ¿En qué te puedo ayudar?",
+        f"{inicio}{' ' + nombre if nombre else ''}. ¿Agendamos, cambiamos o resolvemos una duda?",
+        f"{inicio}{' ' + nombre if nombre else ''}. Dime, ¿qué necesitas?"
+    ]
+    return _stable_pick(base, seed + "g2")
 
 def _ask_missing_date_or_time(state: Dict[str, Any], seed: str) -> str:
     last_date = state.get("last_date")
     if last_date:
-        base = _stable_pick(
-            ["De ese día hay disponibilidad. ¿Qué hora te viene mejor?",
-             "Para ese día tengo espacios. ¿Qué hora prefieres?",
-             "Ese día tengo varias horas. ¿Cuál te acomoda?"],
+        pref = _stable_pick(
+            ["Para ese día sí tengo espacios.", "Ese día hay disponibilidad.", "Hay varias horas libres ese día."],
             seed
         )
-    else:
-        base = _stable_pick(
-            ["Claro. Para avanzar, ¿qué fecha te queda mejor?",
-             "Perfecto. Empecemos por la fecha, ¿cuál te acomoda?",
-             "De acuerdo. Dime primero la fecha y luego vemos horarios."],
-            seed
-        )
-    return polish(base, state.get("user_text",""))
+        return f"{pref} ¿Qué hora te acomoda?"
+    base = [
+        "Claro. Para avanzar, ¿qué fecha te acomoda?",
+        "Perfecto, empecemos por la fecha. ¿Cuál te queda mejor?",
+        "De acuerdo. Dime primero la fecha y enseguida revisamos horarios."
+    ]
+    return _stable_pick(base, seed)
 
-def _greet(state: Dict[str, Any], seed: str) -> str:
-    nombre = (state.get("patient_name") or "").strip()
-    saludo = _stable_pick(["Hola", "Buen día", "¿Qué tal?", "Hola, cuéntame"], seed)
-    base = _stable_pick(
-        [f"{saludo} {nombre}. ¿En qué te ayudo?".strip(),
-         f"{saludo} {nombre}. ¿Agendamos, cambiamos o resuelvo una duda?".strip(),
-         f"{saludo} {nombre}. Dime, ¿qué necesitas?".strip()],
-        seed+"g2"
-    )
-    return polish(base, state.get("user_text",""))
-
-def _no_availability_for_date(state: Dict[str, Any], seed: str) -> str:
-    fecha = _fmt_date(state.get("date_dt")) or "ese día"
-    base = _stable_pick(
-        [f"Para {fecha} ya no tengo espacios. ¿Te propongo fechas cercanas?",
-         f"{fecha} está lleno. ¿Quieres que vea opciones alrededor?",
-         f"No tengo huecos el {fecha}. Si quieres, reviso días cercanos."],
+def _propose_slots_date(state: Dict[str, Any], seed: str) -> str:
+    d = state.get("date_dt")
+    fecha = _fmt_date(d) or "ese día"
+    lst: list[str] = state.get("suggestions") or []
+    header = _stable_pick(
+        [f"Para el {fecha} tengo estos horarios:", f"El {fecha} puedo en:"],
         seed
     )
-    return polish(base, state.get("user_text",""))
+    bullets = "\n".join(lst[:12])
+    cierre = _stable_pick(
+        ["¿Cuál te acomoda mejor?", "¿Te queda alguno de esos?", "Dime cuál te funciona."],
+        seed + "c"
+    )
+    return f"{header}\n{bullets}\n{cierre}"
 
 def _time_unavailable_suggest_list(state: Dict[str, Any], seed: str) -> str:
     fecha = _fmt_date(state.get("date_dt")) or "ese día"
-    lista: list[str] = state.get("suggestions") or []
-    if not lista:
+    lst: list[str] = state.get("suggestions") or []
+    if not lst:
         return _no_availability_for_date(state, seed)
     header = _stable_pick(
-        [f"A esa hora no tengo lugar. Para {fecha} puedo:",
-         f"Esa hora no la tengo. Ese {fecha} puedo ofrecerte:",
-         f"Esa hora no está disponible. Ese {fecha} tengo:"],
+        [f"Esa hora no la tengo. Para el {fecha} puedo:", f"Esa hora no está libre. Ese {fecha} tengo:"],
         seed
     )
-    cierre = _stable_pick(["¿Alguno te funciona?", "¿Cuál te viene mejor?", "Dime si alguno te acomoda."], seed+"c")
-    base = f"{header}\n" + "\n".join(lista[:12]) + f"\n{cierre}"
-    return polish(base, state.get("user_text",""))
+    bullets = "\n".join(lst[:12])
+    cierre = _stable_pick(
+        ["¿Alguno te sirve?", "¿Cuál te queda mejor?", "Dime si alguno te acomoda."],
+        seed + "c"
+    )
+    return f"{header}\n{bullets}\n{cierre}"
+
+def _no_availability_for_date(state: Dict[str, Any], seed: str) -> str:
+    d = state.get("date_dt")
+    fecha = _fmt_date(d) or "ese día"
+    base = [
+        f"Para {fecha} ya no tengo espacios. ¿Vemos fechas cercanas?",
+        f"{fecha} está lleno. Si gustas, te propongo días alrededor.",
+        f"No tengo huecos el {fecha}. ¿Quieres que te comparta opciones cercanas?"
+    ]
+    return _stable_pick(base, seed)
+
+def _ask_confirm_after_name(state: Dict[str, Any], seed: str) -> str:
+    appt_dt: Optional[datetime] = state.get("appt_dt")
+    patient_name: str = (state.get("patient_name") or "").strip()
+    when = _fmt_dt(appt_dt) or "la fecha reservada"
+    saludo = _stable_pick(["Gracias.", "Perfecto.", "De acuerdo."], seed)
+    linea = _stable_pick(
+        [f"{patient_name and patient_name + ', ' or ''}¿confirmamos {when} o prefieres moverla?",
+         f"{patient_name and patient_name + ', ' or ''}¿la dejamos confirmada para {when} o quieres otro horario?"],
+        seed + "l"
+    )
+    return f"{saludo} {linea}".strip()
 
 def _confirm_done(state: Dict[str, Any], seed: str) -> str:
     dt = _fmt_dt(state.get("appt_dt"))
     nombre = (state.get("patient_name") or "").strip()
     n = f" de {nombre}" if nombre else ""
-    base = _stable_pick(
-        [f"Perfecto, confirmada{n} para {dt}. ¿Te ayudo en algo más?",
-         f"Listo: queda confirmada{n} para {dt}. ¿Algo más?",
-         f"Bien, quedó confirmada{n} para {dt}. ¿Necesitas otra cosa?"],
-        seed
-    )
-    return polish(base, state.get("user_text",""))
+    base = [
+        f"Listo: queda confirmada{n} para {dt}. ¿Algo más?",
+        f"Perfecto, confirmada{n} para {dt}. ¿Te apoyo con algo más?",
+        f"Bien, quedó confirmada{n} para {dt}. ¿Necesitas otra cosa?"
+    ]
+    return _stable_pick(base, seed)
 
 def _booked_pending_name(state: Dict[str, Any], seed: str) -> str:
     dt = _fmt_dt(state.get("appt_dt"))
-    base = _stable_pick(
-        [f"Reservé {dt}. ¿A nombre de quién la registramos? (Nombre y apellido)",
-         f"Quedó reservado {dt}. ¿Cómo registramos el nombre del paciente?",
-         f"Anoté {dt}. ¿Me compartes nombre y apellido para el registro?"],
-        seed
-    )
-    return polish(base, state.get("user_text",""))
+    base = [
+        f"Reservé {dt}. ¿A nombre de quién la registramos? (Nombre y apellido)",
+        f"Quedó reservado {dt}. ¿Cómo registramos el nombre del paciente?",
+        f"Anoté {dt}. ¿Me compartes nombre y apellido para el registro?"
+    ]
+    return _stable_pick(base, seed)
 
 def _booked_or_moved_ok(state: Dict[str, Any], seed: str) -> str:
     dt = _fmt_dt(state.get("appt_dt"))
-    base = _stable_pick(
-        [f"Queda para {dt}. ¿Algo más?",
-         f"Perfecto, agendado para {dt}. ¿Necesitas otra cosa?",
-         f"Listo, quedó para {dt}. ¿Te apoyo con algo más?"],
-        seed
-    )
-    return polish(base, state.get("user_text",""))
+    base = [
+        f"Queda para {dt}. ¿Algo más?",
+        f"Perfecto, agendado para {dt}. ¿Te ayudo con algo más?",
+        f"Listo, quedó para {dt}. ¿Necesitas algo más?"
+    ]
+    return _stable_pick(base, seed)
 
 def _canceled_ok(state: Dict[str, Any], seed: str) -> str:
-    base = _stable_pick(
-        ["Listo, ya quedó cancelada. Si gustas, te propongo nuevos horarios.",
-         "Hecho, la cancelé. Si necesitas reagendar, te ayudo.",
-         "Cancelación realizada. ¿Quieres ver opciones para otra fecha?"],
-        seed
-    )
-    return polish(base, state.get("user_text",""))
+    base = [
+        "Listo, ya quedó cancelada. Si gustas, te propongo nuevos horarios.",
+        "Hecho, la cancelé. Si necesitas reagendar, con gusto te ayudo.",
+        "Cancelación realizada. ¿Quieres ver opciones para otra fecha?"
+    ]
+    return _stable_pick(base, seed)
 
 def _prices(state: Dict[str, Any], seed: str) -> str:
     header = _stable_pick(
-        ["Claro, aquí está la lista de precios:",
-         "Con gusto, te comparto los costos:",
-         "Sí, te paso la lista de precios:"],
+        ["Claro, te comparto los costos:", "Con gusto, aquí está la lista de precios:"],
         seed
     )
     cuerpo = (
@@ -155,45 +152,47 @@ def _prices(state: Dict[str, Any], seed: str) -> str:
         "- Holter 24h: $2,800\n"
         "- MAPA: $2,800"
     )
-    cierre = _stable_pick(["¿Tienes alguna otra duda?", "¿Deseas agendar?", "¿Te reservo fecha?"], seed+"p")
-    return polish(f"{header}\n{cuerpo}\n{cierre}", state.get("user_text",""))
+    cierre = _stable_pick(
+        ["¿Te reservo fecha?", "¿Deseas agendar con alguno de estos estudios?", "¿Tienes otra duda?"],
+        seed + "p"
+    )
+    return f"{header}\n{cuerpo}\n{cierre}"
 
 def _location(state: Dict[str, Any], seed: str) -> str:
-    base = _stable_pick(
-        ["Estamos en CLIEMED, Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L.",
-         "La consulta es en CLIEMED: Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L.",
-         "Atendemos en CLIEMED (Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L.)."],
-        seed
-    )
-    return polish(base, state.get("user_text",""))
+    base = [
+        "Estamos en CLIEMED: Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L.",
+        "La consulta es en CLIEMED (Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L.).",
+        "Atendemos en CLIEMED, Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L."
+    ]
+    return _stable_pick(base, seed)
 
 def _goodbye(state: Dict[str, Any], seed: str) -> str:
-    base = _stable_pick(
+    return _stable_pick(
         ["Perfecto. Cualquier cosa me escribes.",
-         "De acuerdo. Si necesitas algo más, estoy aquí.",
+         "De acuerdo. Si necesitas algo más, aquí estoy.",
          "Muy bien. Cuando gustes, me contactas."],
         seed
     )
-    return polish(base, state.get("user_text",""))
 
 def _fallback(state: Dict[str, Any], seed: str) -> str:
-    base = _stable_pick(
-        ["Perdón, no alcancé a entenderte bien. ¿Buscabas agendar, cambiar/confirmar o información de costos/ubicación?",
-         "Creo que me perdí un poco. ¿Quieres agendar, modificar/confirmar una cita o consultar costos/ubicación?",
-         "Se me escapó el detalle. ¿Te ayudo a agendar, reprogramar/confirmar o con costos/ubicación?"],
-        seed
-    )
-    return polish(base, state.get("user_text",""))
+    base = [
+        "Creo que me perdí un poco. ¿Quieres agendar, cambiar/confirmar o consultar costos/ubicación?",
+        "Se me fue el detalle. ¿Te ayudo a agendar, reprogramar/confirmar o con costos/ubicación?"
+    ]
+    return _stable_pick(base, seed)
+
+# ================= interfaz pública =================
 
 def generate_reply(intent: str, user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     state = state or {}
     seed = f"{intent}|{user_text}|{state.get('patient_name','')}|{state.get('last_date','')}|{state.get('date_dt','')}"
     handlers = {
         "greet": _greet,
-        "ask_confirm_after_name": _ask_confirm_after_name,
         "ask_missing_date_or_time": _ask_missing_date_or_time,
-        "no_availability_for_date": _no_availability_for_date,
+        "propose_slots_date": _propose_slots_date,
         "time_unavailable_suggest_list": _time_unavailable_suggest_list,
+        "no_availability_for_date": _no_availability_for_date,
+        "ask_confirm_after_name": _ask_confirm_after_name,
         "confirm_done": _confirm_done,
         "booked_pending_name": _booked_pending_name,
         "booked_or_moved_ok": _booked_or_moved_ok,
@@ -205,9 +204,6 @@ def generate_reply(intent: str, user_text: str, state: Optional[Dict[str, Any]] 
     }
     fn = handlers.get(intent, _fallback)
     try:
-        # Pasamos user_text en state para pulido contextual
-        st = dict(state)
-        st["user_text"] = user_text
-        return fn(st, seed).strip()
+        return fn(state, seed).strip()
     except Exception:
         return _fallback(state, seed)

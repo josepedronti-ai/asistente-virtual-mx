@@ -1,11 +1,10 @@
 # app/replygen/__init__.py
-from .core import generate_reply as _base_generate
-from .llm import polish as _polish
+import os
+from .core import generate_reply as _gen
+from .llm import rewrite_like_human
+
+_USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
 
 def generate_reply(intent: str, user_text: str, state=None) -> str:
-    """
-    1) Genera respuesta estable y correcta (core)
-    2) Si OPENAI_API_KEY está presente (y REPLYGEN_POLISH != 0), la pule para sonar 100% natural
-    """
-    base = _base_generate(intent=intent, user_text=user_text, state=state or {})
-    return _polish(base)
+    s = _gen(intent, user_text, state)
+    return rewrite_like_human(s) if _USE_LLM else s
