@@ -1,4 +1,3 @@
-# app/routers/webhooks.py
 from __future__ import annotations
 from fastapi import APIRouter, Form
 from fastapi.responses import PlainTextResponse
@@ -18,7 +17,7 @@ from ..services.scheduling import (
     delete_event,
 )
 from ..services.nlu import analizar
-from ..replygen import generate_reply
+from ..replygen.core import generate_reply
 
 # =========================
 # Memoria corta (contexto)
@@ -64,16 +63,14 @@ def normalize(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s
 
-_YES_PAT = re.compile(r"\b(s[ií]|claro|correcto|ok|vale|de acuerdo|afirmativo|me parece|est(a|á) bien|perfecto|sale)\b")
+_YES_PAT = re.compile(r"\b(s[ií]|claro|correcto|ok|vale|de acuerdo|afirmativo|me parece|est(a|á) bien|perfecto)\b")
 _NO_PAT  = re.compile(r"\b(no|prefiero cambiar|otra fecha|cambiar fecha|no gracias|mejor no)\b")
-
 def is_yes(s: str) -> bool:
-    t = (s or "").lower().strip()
-    return bool(_YES_PAT.search(t)) or t.startswith(("si","sí","ok"))
-
+    t = (s or "").lower()
+    return bool(_YES_PAT.search(t)) or t.strip().startswith(("si", "sí", "ok"))
 def is_no(s: str) -> bool:
-    t = (s or "").lower().strip()
-    return bool(_NO_PAT.search(t)) or t.startswith("no")
+    t = (s or "").lower()
+    return bool(_NO_PAT.search(t)) or t.strip().startswith("no")
 
 def db_session():
     db = SessionLocal()
@@ -84,14 +81,6 @@ def db_session():
 
 def get_patient_by_contact(db: Session, contact: str) -> models.Patient | None:
     return db.query(models.Patient).filter(models.Patient.contact == contact).first()
-
-def get_appt_by_id(db: Session, appt_id: int | None) -> models.Appointment | None:
-    if not appt_id:
-        return None
-    try:
-        return db.get(models.Appointment, appt_id)
-    except Exception:
-        return None
 
 def find_latest_reserved_for_contact(db: Session, contact: str):
     return (
@@ -191,31 +180,36 @@ def parse_time_hint(text: str):
         return int(m.group(1)), 0
     return None
 
-def human_list(slots, limit=12, balanced=True):
+def human_slot_strings(slots, limit=12, balanced=True):
     if not slots:
-        return ""
+        return []
     selected = slots
     if balanced and len(slots) > limit:
         step = max(1, len(slots) // limit)
         selected = [slots[i] for i in range(0, len(slots), step)][:limit]
-    return "\n".join(s.strftime("%d/%m/%Y %H:%M") for s in selected)
+    return [s.strftime("%d/%m/%Y %H:%M") for s in selected]
 
+# --- Fechas en español ---
 _WEEK_MAP = {
     "lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2,
     "jueves": 3, "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6
 }
 def extract_spanish_date(text: str, today: date) -> date | None:
     t = (text or "").lower()
-    if "pasado mañana" in t: return today + timedelta(days=2)
-    if "mañana" in t: return today + timedelta(days=1)
-    if "hoy" in t: return today
-    for w, idx in _WEEK_MAP.items():  # noqa: E275 (spacing in key to avoid accidental pasting mistakes)
+    if "pasado mañana" in t:
+        return today + timedelta(days=2)
+    if "mañana" in t:
+        return today + timedelta(days=1)
+    if "hoy" in t:
+        return today
+    for w, idx in _WEEK_MAP.items():
         if re.search(rf"\b{w}\b", t):
             delta = (idx - today.weekday()) % 7
-            if delta == 0: delta = 7
+            if delta == 0:
+                delta = 7
             return today + timedelta(days=delta)
     try:
-        dt = dtparser.parse(t, dayfirst=False, fuzzy=True)
+        dt = dtparser.parse(t, dayfirst=True, fuzzy=True)
         return dt.date()
     except Exception:
         return None
@@ -226,114 +220,71 @@ router = APIRouter(prefix="", tags=["webhooks"])
 async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     if not From:
         return ""
+
     raw_text = Body or ""
     text = normalize(raw_text)
 
-    # ========= 0) Nombre pendiente tras RESERVA =========
+    # 0) Si hay una cita RESERVADA y falta nombre → pedir nombre o confirmar
     for db in db_session():
         patient = get_patient_by_contact(db, From)
-        if not patient:
-            break
-        pending_appt_id = (get_ctx(From) or {}).get("pending_appt_id")
-        appt = get_appt_by_id(db, pending_appt_id) if pending_appt_id else find_latest_reserved_for_contact(db, From)
-        if appt and (patient.name is None or not patient.name.strip()):
-            # ¿mandó un nombre?
-            t = raw_text.strip()
-            if re.fullmatch(r"[A-Za-zÁÉÍÓÚáéíóúÑñ'’\s]{3,60}", t) and len(t.split()) >= 2:
-                patient.name = " ".join(p.capitalize() for p in t.split())
-                db.commit()
-                # Pedir confirmación explícita y marcar flag
-                update_ctx(From, await_final_confirm=True, pending_appt_id=appt.id)
-                msg = generate_reply("ask_confirm_after_name", raw_text, {"appt_dt": appt.start_at, "patient_name": patient.name})
-                send_text(From, msg)
-                return ""
-            else:
-                send_text(From, "¿A nombre de quién registramos la cita? (Nombre y apellido)")
-                return ""
+        pending = find_latest_reserved_for_contact(db, From) if patient else None
+        if patient and pending and (patient.name is None or not patient.name.strip()):
+            send_text(From, "Para finalizar, ¿me comparte el nombre y apellido del paciente?")
+            return ""
 
-    # ========= 1) Flujos de sí/no en contexto =========
+    # 1) Saludo humano formal (según hora)
+    if text in ("hola","buenas","menu","menú","buenos dias","buenas tardes","buenas noches"):
+        send_text(From, generate_reply("greet", {"now": datetime.now()}))
+        return ""
+
+    # Atajo: si el usuario escribe solo hora
+    explicit_time_pre = parse_time_hint(raw_text)
     ctx = get_ctx(From) or {}
 
-    # a) Confirmación final después del nombre
-    if ctx.get("await_final_confirm"):
-        for db in db_session():
-            appt = get_appt_by_id(db, ctx.get("pending_appt_id")) or find_latest_reserved_for_contact(db, From)
-            patient = get_patient_by_contact(db, From)
-            if not appt:
-                break
-            if is_yes(raw_text):
-                appt.status = models.AppointmentStatus.confirmed
-                if not appt.event_id:
-                    try:
-                        ev_id = create_event(
-                            summary=f"Consulta — {patient.name or 'Paciente'}",
-                            start_local=appt.start_at,
-                            duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
-                            location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
-                            description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
-                        )
-                        appt.event_id = ev_id
-                    except Exception:
-                        pass
-                db.commit()
-                clear_ctx_flags(From, "await_final_confirm", "pending_appt_id")
-                send_text(From, generate_reply("confirm_done", raw_text, {"appt_dt": appt.start_at, "patient_name": (patient.name if patient else "")}))
-                return ""
-            if is_no(raw_text):
-                clear_ctx_flags(From, "await_final_confirm")
-                send_text(From, generate_reply("ask_missing_date_or_time", raw_text, {}))
-                return ""
-        # si no hubo resolución, seguimos
-
-    # b) Mantener fecha y solo cambiar hora
     awaiting_keep = ctx.get("await_keep_date", False)
     awaiting_new_date = ctx.get("await_new_date", False)
 
-    if awaiting_keep and is_yes(raw_text):
-        keep_date = ctx.get("pending_date")
-        pending_time = ctx.get("pending_time")  # (h,m) o None
-        clear_ctx_flags(From, "await_keep_date")
-        if not keep_date:
-            send_text(From, generate_reply("ask_missing_date_or_time", raw_text, {}))
-            return ""
-        if not pending_time:
-            update_ctx(From, last_date=keep_date)
-            send_text(From, generate_reply("ask_missing_date_or_time", raw_text, {"last_date": keep_date}))
-            return ""
-        target_h, target_m = pending_time
-        for db in db_session():
-            slots = available_slots(db, keep_date, settings.TIMEZONE)
-            if not slots:
-                send_text(From, generate_reply("no_availability_for_date", raw_text, {"date_dt": keep_date}))
-                break
-            match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
-            patient = get_or_create_patient(db, From)
-            if match:
-                appt = move_or_create_appointment(db, patient, match)
-                SESSION_CTX.pop(From, None)
-                if not patient.name:
-                    update_ctx(From, pending_appt_id=appt.id, await_final_confirm=True)
-                    send_text(From, generate_reply("booked_pending_name", raw_text, {"appt_dt": appt.start_at}))
+    # Manejo de sí/no para mantener fecha al reprogramar
+    if awaiting_keep:
+        if is_yes(raw_text):
+            keep_date = ctx.get("pending_date")
+            pending_time = ctx.get("pending_time")
+            clear_ctx_flags(From, "await_keep_date")
+            if not keep_date:
+                send_text(From, generate_reply("ask_date_strict"))
+                return ""
+            if not pending_time:
+                update_ctx(From, last_date=keep_date)
+                send_text(From, generate_reply("confirm_date_time", {"date_dt": datetime.combine(keep_date, datetime.min.time())}))
+                return ""
+            target_h, target_m = pending_time
+            for db in db_session():
+                slots = available_slots(db, keep_date, settings.TIMEZONE)
+                if not slots:
+                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(keep_date, datetime.min.time())}))
+                    break
+                match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
+                patient = get_or_create_patient(db, From)
+                if match:
+                    appt = move_or_create_appointment(db, patient, match)
+                    SESSION_CTX.pop(From, None)
+                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
                 else:
-                    send_text(From, generate_reply("booked_or_moved_ok", raw_text, {"appt_dt": appt.start_at}))
-            else:
-                sorted_by_diff = sorted(slots, key=lambda x: abs((x.hour*60 + x.minute) - (target_h*60 + target_m)))
-                sample = human_list(sorted_by_diff, limit=12, balanced=False)
-                set_ctx(From, keep_date)
-                send_text(From, generate_reply("time_unavailable_suggest_list", raw_text, {"date_dt": keep_date, "suggestions": sample.split("\n")}))
-        return ""
-
-    if awaiting_keep and is_no(raw_text):
-        clear_ctx_flags(From, "await_keep_date")
-        update_ctx(From, await_new_date=True)
-        send_text(From, generate_reply("ask_missing_date_or_time", raw_text, {}))
-        return ""
+                    alts = human_slot_strings(slots, limit=12, balanced=False)
+                    set_ctx(From, keep_date)
+                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(keep_date, datetime.min.time()), "slots_list": alts}))
+            return ""
+        if is_no(raw_text):
+            clear_ctx_flags(From, "await_keep_date")
+            update_ctx(From, await_new_date=True)
+            send_text(From, generate_reply("ask_date_strict"))
+            return ""
 
     if awaiting_new_date:
         today_local = datetime.now().date()
         parsed_new_date = extract_spanish_date(raw_text, today_local)
         if not parsed_new_date:
-            send_text(From, generate_reply("ask_missing_date_or_time", raw_text, {}))
+            send_text(From, generate_reply("ask_date_strict"))
             return ""
         pending_time = ctx.get("pending_time")
         if pending_time:
@@ -341,7 +292,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             for db in db_session():
                 slots = available_slots(db, parsed_new_date, settings.TIMEZONE)
                 if not slots:
-                    send_text(From, generate_reply("no_availability_for_date", raw_text, {"date_dt": parsed_new_date}))
+                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time())}))
                     break
                 match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
                 patient = get_or_create_patient(db, From)
@@ -349,42 +300,26 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     appt = move_or_create_appointment(db, patient, match)
                     clear_ctx_flags(From, "await_new_date", "pending_time")
                     SESSION_CTX[From]["last_date"] = parsed_new_date
-                    if not patient.name:
-                        update_ctx(From, pending_appt_id=appt.id, await_final_confirm=True)
-                        send_text(From, generate_reply("booked_pending_name", raw_text, {"appt_dt": appt.start_at}))
-                    else:
-                        send_text(From, generate_reply("booked_or_moved_ok", raw_text, {"appt_dt": appt.start_at}))
+                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
                 else:
-                    sorted_by_diff = sorted(slots, key=lambda x: abs((x.hour*60 + x.minute) - (target_h*60 + target_m)))
-                    sample = human_list(sorted_by_diff, limit=12, balanced=False)
+                    alts = human_slot_strings(slots, limit=12, balanced=False)
                     set_ctx(From, parsed_new_date)
                     clear_ctx_flags(From, "await_new_date")
-                    send_text(From, generate_reply("time_unavailable_suggest_list", raw_text, {"date_dt": parsed_new_date, "suggestions": sample.split("\n")}))
+                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time()), "slots_list": alts}))
             return ""
-        else:
-            for db in db_session():
-                slots = available_slots(db, parsed_new_date, settings.TIMEZONE)
-                if not slots:
-                    send_text(From, generate_reply("no_availability_for_date", raw_text, {"date_dt": parsed_new_date}))
-                    break
-                sample = human_list(slots, limit=12, balanced=True)
-                set_ctx(From, parsed_new_date)
-                clear_ctx_flags(From, "await_new_date")
-                send_text(From, generate_reply("propose_slots_date", raw_text, {"date_dt": parsed_new_date, "suggestions": sample.split("\n")}))
-            return ""
-
-    # ========= 2) Saludo rápido =========
-    if text in ("hola","buenas","menu","menú","buenos dias","buenas tardes","buenas noches"):
-        nombre_opt = ""
+        # sin hora → mostrar lista y pedir hora
         for db in db_session():
-            p = get_patient_by_contact(db, From)
-            if p and p.name:
-                nombre_opt = p.name
-            break
-        send_text(From, generate_reply("greet", raw_text, {"patient_name": nombre_opt}))
+            slots = available_slots(db, parsed_new_date, settings.TIMEZONE)
+            if not slots:
+                send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time())}))
+                break
+            alts = human_slot_strings(slots, limit=12, balanced=True)
+            set_ctx(From, parsed_new_date)
+            clear_ctx_flags(From, "await_new_date")
+            send_text(From, generate_reply("list_slots_for_date", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time()), "slots_list": alts}))
         return ""
 
-    # ========= 3) NLU base =========
+    # 2) NLU
     nlu = analizar(raw_text)
     intent = nlu.get("intent", "fallback")
     entities = nlu.get("entities", {}) or {}
@@ -395,29 +330,33 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     nlu_date = entities.get("date") or ""
     topic = entities.get("topic") or ""
 
-    # Despedida corta
+    # Despedidas
     if text in ("no","no gracias","gracias","listo","es todo","ninguno","ninguna"):
-        send_text(From, generate_reply("goodbye", raw_text, {}))
+        send_text(From, generate_reply("goodbye"))
         return ""
 
-    # Info
-    if intent == "info":
+    # Información
+    if intent == "info" and not explicit_time_pre:
         if topic in ("costos","costo","precio","precios"):
-            send_text(From, generate_reply("prices", raw_text, {})); return ""
+            send_text(From, generate_reply("prices"))
+            return ""
         if topic in ("ubicacion","ubicación","direccion","dirección"):
-            send_text(From, generate_reply("location", raw_text, {})); return ""
-        send_text(From, reply or generate_reply("fallback", raw_text, {})); return ""
+            send_text(From, "Estamos en **CLIEMED**, Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L.")
+            return ""
+        send_text(From, reply or "¿Desea costos o ubicación?")
+        return ""
 
-    # Confirmar directa
-    if intent == "confirm":
+    # Confirmar
+    if intent == "confirm" and not explicit_time_pre:
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
             if not appt:
-                send_text(From, generate_reply("fallback", raw_text, {})); break
+                send_text(From, "Para confirmar necesito un horario reservado. ¿Desea que le proponga horarios?")
+                break
             patient = get_patient_by_contact(db, From)
             if patient and (not patient.name or not patient.name.strip()):
-                update_ctx(From, pending_appt_id=appt.id, await_final_confirm=True)
-                send_text(From, generate_reply("booked_pending_name", raw_text, {"appt_dt": appt.start_at})); break
+                send_text(From, "Antes de confirmar, ¿me comparte el nombre y apellido del paciente?")
+                break
             appt.status = models.AppointmentStatus.confirmed
             if not appt.event_id:
                 try:
@@ -427,119 +366,138 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                         duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
                         location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
                         description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
-                    ); appt.event_id = ev_id
+                    )
+                    appt.event_id = ev_id
                 except Exception:
                     pass
             db.commit()
-            send_text(From, generate_reply("confirm_done", raw_text, {"appt_dt": appt.start_at, "patient_name": (patient.name if patient else "")}))
+            send_text(From, f"Confirmado. Quedó para {appt.start_at.strftime('%d/%m/%Y %H:%M')}. ¿Le ayudo con algo más?")
         return ""
 
     # Cancelar
-    if intent == "cancel":
+    if intent == "cancel" and not explicit_time_pre:
         for db in db_session():
             appt = find_latest_active_for_contact(db, From)
             if not appt:
-                send_text(From, generate_reply("fallback", raw_text, {})); break
+                send_text(From, "No encuentro una cita activa. Si gusta, puedo ayudarle a agendar una nueva.")
+                break
             appt.status = models.AppointmentStatus.canceled
             if appt.event_id:
-                try: delete_event(appt.event_id)
-                except Exception: pass
+                try:
+                    delete_event(appt.event_id)
+                except Exception:
+                    pass
                 appt.event_id = None
             db.commit()
-            send_text(From, generate_reply("canceled_ok", raw_text, {}))
+            send_text(From, "Listo, quedó cancelada. ¿Desea revisar fechas para reprogramar?")
         return ""
 
     # Agendar / Reprogramar
-    if intent in ("book","reschedule") or parse_time_hint(raw_text):
+    if intent in ("book","reschedule") or explicit_time_pre:
         today_local = datetime.now().date()
         parsed_date = None
-        if entities.get("date"): parsed_date = extract_spanish_date(entities["date"], today_local)
-        if not parsed_date: parsed_date = extract_spanish_date(raw_text, today_local)
+
+        if nlu_date:
+            parsed_date = extract_spanish_date(raw_text, today_local)
+        if not parsed_date:
+            parsed_date = extract_spanish_date(raw_text, today_local)
+
         explicit_time = parse_time_hint(raw_text)
 
+        # Solo hora y hay cita activa → preguntar si mantiene fecha
         if intent in ("reschedule","book") and explicit_time and not parsed_date:
             for db in db_session():
                 appt = find_latest_active_for_contact(db, From)
                 if appt:
                     appt_date = appt.start_at.date()
                     update_ctx(From, await_keep_date=True, pending_date=appt_date, pending_time=explicit_time)
-                    msg = f"¿Mantenemos la fecha del {appt_date.strftime('%d/%m/%Y')} y cambiamos sólo la hora?"
-                    send_text(From, msg); return ""
-            send_text(From, generate_reply("ask_missing_date_or_time", raw_text, {})); return ""
+                    send_text(From, f"¿Desea mantener la fecha del {appt_date.strftime('%d/%m/%Y')} y cambiar solo la hora? (sí/no)")
+                    return ""
+            send_text(From, generate_reply("ask_date_strict"))
+            return ""
 
+        # Si hay hora y tenemos fecha en contexto → usarla
         ctx = get_ctx(From) or {}
         if not parsed_date and explicit_time and ctx.get("last_date"):
             parsed_date = ctx["last_date"]
 
+        # Caso A: fecha sí, hora no → listar y pedir hora
         if parsed_date and not explicit_time:
             for db in db_session():
                 slots = available_slots(db, parsed_date, settings.TIMEZONE)
                 if not slots:
-                    send_text(From, generate_reply("no_availability_for_date", raw_text, {"date_dt": parsed_date})); break
-                sample = human_list(slots, limit=12, balanced=True)
+                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_date, datetime.min.time())}))
+                    break
+                alts = human_slot_strings(slots, limit=12, balanced=True)
                 set_ctx(From, parsed_date)
-                send_text(From, generate_reply("propose_slots_date", raw_text, {"date_dt": parsed_date, "suggestions": sample.split("\n")}))
+                send_text(From, generate_reply("list_slots_for_date", {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}))
             return ""
 
+        # Caso B: hora sí, fecha no → pedir fecha
         if explicit_time and not parsed_date:
-            send_text(From, generate_reply("ask_missing_date_or_time", raw_text, {})); return ""
+            send_text(From, generate_reply("ask_date_strict"))
+            return ""
 
+        # Caso C: fecha sí y hora sí → reservar
         if parsed_date and explicit_time:
             target_h, target_m = explicit_time
             for db in db_session():
                 slots = available_slots(db, parsed_date, settings.TIMEZONE)
                 if not slots:
-                    send_text(From, generate_reply("no_availability_for_date", raw_text, {"date_dt": parsed_date})); break
+                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_date, datetime.min.time())}))
+                    break
                 match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
                 patient = get_or_create_patient(db, From)
                 if match:
                     appt = move_or_create_appointment(db, patient, match)
                     SESSION_CTX.pop(From, None)
-                    if not patient.name:
-                        update_ctx(From, pending_appt_id=appt.id, await_final_confirm=True)
-                        send_text(From, generate_reply("booked_pending_name", raw_text, {"appt_dt": appt.start_at}))
-                    else:
-                        send_text(From, generate_reply("booked_or_moved_ok", raw_text, {"appt_dt": appt.start_at}))
+                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
                 else:
-                    sorted_by_diff = sorted(slots, key=lambda x: abs((x.hour*60 + x.minute) - (target_h*60 + target_m)))
-                    sample = human_list(sorted_by_diff, limit=12, balanced=False)
+                    alts = human_slot_strings(slots, limit=12, balanced=False)
                     set_ctx(From, parsed_date)
-                    send_text(From, generate_reply("time_unavailable_suggest_list", raw_text, {"date_dt": parsed_date, "suggestions": sample.split("\n")}))
+                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}))
             return ""
 
-    # Últimos recursos
+        # Caso D: falta info
+        send_text(From, generate_reply("ask_date_strict"))
+        return ""
+
+    # Smalltalk por NLU (si llega)
+    if intent in ("smalltalk","greet"):
+        send_text(From, generate_reply("greet", {"now": datetime.now()}))
+        return ""
+
+    # Parser natural (último recurso)
     try:
-        dt = dtparser.parse(text, dayfirst=False, fuzzy=True)
+        dt = dtparser.parse(text, dayfirst=True, fuzzy=True)
         d = dt.date()
         lowered = text.lower()
         has_time_hint = (":" in lowered) or (" am" in lowered) or (" pm" in lowered)
         for db in db_session():
             slots = available_slots(db, d, settings.TIMEZONE)
             if not slots:
-                send_text(From, generate_reply("no_availability_for_date", raw_text, {"date_dt": d})); break
+                send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(d, datetime.min.time())}))
+                break
             if has_time_hint:
-                target_h, target_m = dt.hour, dt.minute
+                target_h = dt.hour; target_m = dt.minute
                 match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
                 patient = get_or_create_patient(db, From)
                 if match:
                     appt = move_or_create_appointment(db, patient, match)
                     SESSION_CTX.pop(From, None)
-                    if not patient.name:
-                        update_ctx(From, pending_appt_id=appt.id, await_final_confirm=True)
-                        send_text(From, generate_reply("booked_pending_name", raw_text, {"appt_dt": appt.start_at}))
-                    else:
-                        send_text(From, generate_reply("booked_or_moved_ok", raw_text, {"appt_dt": appt.start_at}))
+                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
                 else:
-                    sample = human_list(slots, limit=12, balanced=False)
+                    alts = human_slot_strings(slots, limit=12, balanced=False)
                     set_ctx(From, d)
-                    send_text(From, generate_reply("time_unavailable_suggest_list", raw_text, {"date_dt": d, "suggestions": sample.split("\n")}))
+                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(d, datetime.min.time()), "slots_list": alts}))
             else:
-                sample = human_list(slots, limit=12, balanced=True)
+                alts = human_slot_strings(slots, limit=12, balanced=True)
                 set_ctx(From, d)
-                send_text(From, generate_reply("propose_slots_date", raw_text, {"date_dt": d, "suggestions": sample.split("\n")}))
+                send_text(From, generate_reply("list_slots_for_date", {"date_dt": datetime.combine(d, datetime.min.time()), "slots_list": alts}))
         return ""
     except Exception:
         pass
 
-    send_text(From, generate_reply("fallback", raw_text, {}))
+    # Fallback final
+    send_text(From, generate_reply("fallback"))
     return ""
