@@ -1,5 +1,6 @@
 fastapi>=0.110,<0.116
 uvicorn[standard]>=0.24,<0.31
+gunicorn>=21.2,<22
 SQLAlchemy>=2.0.25,<2.1
 pydantic>=2.6,<2.9
 pydantic-settings>=2.2,<2.5
@@ -17,3 +18,4 @@ google-auth==2.40.3
 google-auth-httplib2==0.2.0
 pytz==2025.2
 google-auth-oauthlib==1.2.2
+dateparser==1.2.2
