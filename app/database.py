@@ -3,32 +3,44 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
 
-# Render → Environment → DATABASE_URL
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Detecta si es SQLite para ajustar opciones (local dev)
-connect_args = {"check_same_thread": False} if DATABASE_URL and DATABASE_URL.startswith("sqlite") else {}
+def _int_from_env(name: str, default: int | None):
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return default
+    try:
+        return int(val)
+    except Exception:
+        return default
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args=connect_args,
-    pool_pre_ping=True,         # mantiene viva la conexión
-    pool_size=5 if DATABASE_URL and DATABASE_URL.startswith("postgres") else None,
-    max_overflow=5 if DATABASE_URL and DATABASE_URL.startswith("postgres") else None,
-    future=True,
-)
+# Construimos kwargs sin pasar None accidentales
+engine_kwargs = {
+    "pool_pre_ping": True,
+    "future": True,
+}
 
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine,
-    future=True,
-)
+_pool_size = _int_from_env("DB_POOL_SIZE", 5)
+_max_overflow = _int_from_env("DB_MAX_OVERFLOW", 10)
+_pool_timeout = _int_from_env("DB_POOL_TIMEOUT", 30)   # segundos
+_pool_recycle = _int_from_env("DB_POOL_RECYCLE", 1800) # 30 min
 
+# Solo añadimos si no son None
+if _pool_size is not None:
+    engine_kwargs["pool_size"] = _pool_size
+if _max_overflow is not None:
+    engine_kwargs["max_overflow"] = _max_overflow
+if _pool_timeout is not None:
+    engine_kwargs["pool_timeout"] = _pool_timeout
+if _pool_recycle is not None:
+    engine_kwargs["pool_recycle"] = _pool_recycle
+
+engine = create_engine(DATABASE_URL, **engine_kwargs)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
 Base = declarative_base()
 
 def init_db():
-    """Crear tablas solo si no usamos Alembic todavía."""
-    if os.getenv("SKIP_CREATE_ALL", "0") == "1":
-        return
-    Base.metadata.create_all(bind=engine)
+    # Fase 1: crear tablas una sola vez
+    if os.getenv("SKIP_CREATE_ALL", "0") not in ("1", "true", "True"):
+        Base.metadata.create_all(bind=engine)
