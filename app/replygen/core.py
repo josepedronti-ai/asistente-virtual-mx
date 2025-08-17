@@ -1,3 +1,4 @@
+# app/replygen/core.py
 from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Optional, List
@@ -32,14 +33,14 @@ def _time_greeting(now: Optional[datetime] = None) -> str:
 def _list_as_lines(items: List[str], limit: int = 12) -> str:
     return "\n".join(items[:limit])
 
-# 1) Saludo
+# 1) Saludo (time-aware)
 def _greet(state: Dict[str, Any]) -> str:
     saludo = _time_greeting(state.get("now"))
     return f"Hola, {saludo}. Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?"
 
-# 2) Pedir fecha (Opción A acordada)
+# 2) Pedir fecha (estricto, para reducir errores)
 def _ask_date_strict(state: Dict[str, Any]) -> str:
-    return "Claro, para agendar su cita, ¿me podría indicar la **fecha exacta** en formato **Día/Mes/Año**?"
+    return "Claro, para agendar su cita, ¿me podría indicar la fecha exacta en formato Día/Mes/Año?"
 
 # 3) Listar horarios de una fecha
 def _list_slots_for_date(state: Dict[str, Any]) -> str:
@@ -49,15 +50,15 @@ def _list_slots_for_date(state: Dict[str, Any]) -> str:
     lista = _list_as_lines(slots, limit=12)
     return f"Perfecto. Para el {fecha} tengo disponibles los siguientes horarios:\n{lista}\n¿Cuál prefiere?"
 
-# 4) Confirmar fecha y hora
+# 4) Confirmar fecha y hora (si lo llegas a usar)
 def _confirm_date_time(state: Dict[str, Any]) -> str:
     d: Optional[datetime] = state.get("date_dt")
-    t: Optional[datetime] = state.get("time_dt") or d  # si ya viene junto
+    t: Optional[datetime] = state.get("time_dt") or d
     fecha = _fmt_date(d)
     hora  = _fmt_time(t)
     return f"Para confirmar, sería el 📅 {fecha} a las ⏰ {hora}. ¿Es correcto?"
 
-# 5) Reservado OK
+# 5) Reservado OK (respuesta tras reservar/mover)
 def _reserved_ok(state: Dict[str, Any]) -> str:
     dt = state.get("appt_dt")
     fecha = _fmt_date(dt)
@@ -70,7 +71,7 @@ def _reserved_ok(state: Dict[str, Any]) -> str:
         "Si en algún momento necesita reprogramar o cancelar, con gusto le apoyo."
     )
 
-# 6) Día lleno
+# 6) Día lleno (sin espacios)
 def _day_full(state: Dict[str, Any]) -> str:
     d: Optional[datetime] = state.get("date_dt")
     fecha = _fmt_date(d) or "esa fecha"
@@ -114,6 +115,33 @@ def _prices(state: Dict[str, Any]) -> str:
 def _goodbye(state: Dict[str, Any]) -> str:
     return "Perfecto, quedo a sus órdenes para cualquier duda o si desea agendar más adelante. Que tenga un excelente día."
 
+# 11) Solicitar nombre para cerrar reserva pendiente
+def _need_name(state: Dict[str, Any]) -> str:
+    return "Para finalizar, ¿me comparte el nombre y apellido del paciente?"
+
+# 12) Confirmación exitosa (cuando se confirma una reserva existente)
+def _confirm_done(state: Dict[str, Any]) -> str:
+    dt = state.get("appt_dt")
+    fecha = _fmt_date(dt)
+    hora  = _fmt_time(dt)
+    nombre = (state.get("patient_name") or "").strip()
+    n = f" del paciente {nombre}" if nombre else ""
+    return f"Confirmado{n}. Quedó para el 📅 {fecha} a las ⏰ {hora}. ¿Le ayudo con algo más?"
+
+# 13) Cancelación realizada
+def _canceled_ok(state: Dict[str, Any]) -> str:
+    return "Listo, quedó cancelada. ¿Desea revisar fechas para reprogramar?"
+
+# 14) Ubicación
+def _location(state: Dict[str, Any]) -> str:
+    return "Estamos en CLIEMED, Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L."
+
+# 15) Pregunta si desea mantener la misma fecha al reprogramar (solo cambiar hora)
+def _keep_same_date_q(state: Dict[str, Any]) -> str:
+    d: Optional[datetime] = state.get("date_dt")
+    fecha = _fmt_date(d)
+    return f"¿Desea mantener la fecha del {fecha} y cambiar solo la hora? (sí/no)"
+
 # Fallback
 def _fallback(state: Dict[str, Any]) -> str:
     return "Disculpe, ¿desea agendar, cambiar/confirmar una cita o consultar precios/ubicación?"
@@ -132,6 +160,11 @@ _HANDLERS = {
     "has_active_appt": _has_active_appt,
     "prices": _prices,
     "goodbye": _goodbye,
+    "need_name": _need_name,
+    "confirm_done": _confirm_done,
+    "canceled_ok": _canceled_ok,
+    "location": _location,
+    "keep_same_date_q": _keep_same_date_q,
     "fallback": _fallback,
 }
 

@@ -8,9 +8,13 @@ try:
 except Exception:
     OpenAI = None  # type: ignore
 
+# -----------------------------
+# Config
+# -----------------------------
 _API_KEY = os.getenv("OPENAI_API_KEY")
-_USE_LLM = bool(_API_KEY and OpenAI)
+_MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
 
+_USE_LLM = bool(_API_KEY and OpenAI)
 _client: Optional["OpenAI"] = None
 if _USE_LLM:
     try:
@@ -19,29 +23,44 @@ if _USE_LLM:
         _client = None
         _USE_LLM = False
 
+# Instrucciones: reescribir sin alterar hechos (fechas/horas/números)
 _SYSTEM = (
-    "Eres un asistente de consultorio médico en México. Redactas como humano, cálido, claro y profesional. "
-    "Trato de usted. Sin emojis. Frases naturales mexicanas. Breve, directo, amable. "
-    "Evitas sonar robótico. No inventes datos de agenda: solo reescribe el texto que te doy."
+    "Eres un asistente de consultorio médico en México. "
+    "Reescribes mensajes para que suenen naturales, cálidos y profesionales con trato de usted. "
+    "Evita sonar robótico, no uses emojis ni signos excesivos. "
+    "Usa expresiones comunes en México. Sé breve y claro.\n"
+    "MUY IMPORTANTE: NO cambies el sentido ni los datos explícitos del texto original "
+    "(no alteres fechas, horas, montos, nombres, direcciones). "
+    "NO inventes información nueva ni añadas preguntas extra. "
+    "Solo mejora la redacción del texto proporcionado."
 )
 
 def polish_spanish_mx(text: str) -> str:
     """
     Pulido opcional con LLM (si OPENAI_API_KEY está presente).
-    Reescribe en tono humano MX (usted), sin emojis.
+    - Tono: profesional, humano, MX, usted.
+    - Sin emojis.
+    - No altera datos (fechas/horas/precios/nombres).
+    Si no hay API o hay error, devuelve el texto tal cual.
     """
-    if not (_USE_LLM and _client and text):
+    if not text:
+        return text
+    if not (_USE_LLM and _client):
         return text
     try:
         resp = _client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.4,
+            model=_MODEL,
+            temperature=0.3,
             messages=[
                 {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": f"Reescribe de forma natural y profesional (usted, MX, sin emojis):\n{text}"}
+                {"role": "user", "content": f"Reescribe en español de México (usted, sin emojis), sin cambiar datos:\n\n{text}"},
             ],
         )
         out = (resp.choices[0].message.content or "").strip()
         return out if out else text
     except Exception:
         return text
+
+# Alias conveniente si prefieres este nombre en el resto del código
+def polish_if_enabled(text: str) -> str:
+    return polish_spanish_mx(text)

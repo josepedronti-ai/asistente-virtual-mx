@@ -1,8 +1,10 @@
+# app/routers/webhooks.py
 from __future__ import annotations
 from fastapi import APIRouter, Form
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 from dateutil import parser as dtparser
+from dateparser import parse as dp_parse
 import unicodedata, re
 from datetime import datetime, timedelta, date
 
@@ -18,6 +20,7 @@ from ..services.scheduling import (
 )
 from ..services.nlu import analizar
 from ..replygen.core import generate_reply
+from ..replygen.llm import polish_spanish_mx as polish  # pulido humano si hay OPENAI_API_KEY
 
 # =========================
 # Memoria corta (contexto)
@@ -27,7 +30,7 @@ CTX_TTL_MIN = 15
 
 def set_ctx(contact: str, last_date, **extra):
     SESSION_CTX[contact] = {
-        "last_date": last_date,
+        "last_date": last_date,  # date
         "ts": datetime.utcnow(),
         **extra
     }
@@ -55,7 +58,7 @@ def get_ctx(contact: str):
     return d
 
 # ----------------------------
-# Utilidades
+# Utilidades de texto y hora
 # ----------------------------
 def normalize(s: str) -> str:
     s = (s or "").strip().lower()
@@ -63,6 +66,7 @@ def normalize(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s
 
+# Sí / No humanos
 _YES_PAT = re.compile(r"\b(s[ií]|claro|correcto|ok|vale|de acuerdo|afirmativo|me parece|est(a|á) bien|perfecto)\b")
 _NO_PAT  = re.compile(r"\b(no|prefiero cambiar|otra fecha|cambiar fecha|no gracias|mejor no)\b")
 def is_yes(s: str) -> bool:
@@ -93,6 +97,7 @@ def find_latest_reserved_for_contact(db: Session, contact: str):
     )
 
 def find_latest_active_for_contact(db: Session, contact: str):
+    """Activa = reservada o confirmada."""
     return (
         db.query(models.Appointment)
         .join(models.Patient)
@@ -109,13 +114,20 @@ def get_or_create_patient(db: Session, contact: str) -> models.Patient:
     p = get_patient_by_contact(db, contact)
     if p:
         return p
-    p = models.Patient(contact=contact)
+    p = models.Patient(contact=contact)  # nombre se pedirá después
     db.add(p)
     db.commit()
     db.refresh(p)
     return p
 
 def move_or_create_appointment(db: Session, patient: models.Patient, start_dt: datetime) -> models.Appointment:
+    """
+    - Si hay cita ACTIVA (reservada/confirmada), la mueve a start_dt.
+    - Si estaba confirmada:
+        - con event_id → update_event
+        - sin event_id → create_event
+    - Si no hay activa, crea una nueva RESERVADA.
+    """
     appt = (
         db.query(models.Appointment)
         .filter(models.Appointment.patient_id == patient.id)
@@ -165,22 +177,31 @@ def move_or_create_appointment(db: Session, patient: models.Patient, start_dt: d
     return appt
 
 def parse_time_hint(text: str):
+    """
+    Extrae hora explícita (10:30, 4 pm, 16:00). Devuelve (hour, minute) o None.
+    """
     t = (text or "").lower().strip()
+    # hh:mm
     m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t)
     if m:
         return int(m.group(1)), int(m.group(2))
+    # h am/pm
     m = re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t)
     if m:
         h = int(m.group(1)); ampm = m.group(2)
         if ampm == "pm" and h != 12: h += 12
         if ampm == "am" and h == 12: h = 0
         return h, 0
+    # hh (24h)
     m = re.search(r"\b(0?\d|1\d|2[0-3])\s*h?\b", t)
     if m:
         return int(m.group(1)), 0
     return None
 
 def human_slot_strings(slots, limit=12, balanced=True):
+    """
+    Devuelve hasta 'limit' horarios humanamente repartidos a lo largo del día.
+    """
     if not slots:
         return []
     selected = slots
@@ -189,33 +210,94 @@ def human_slot_strings(slots, limit=12, balanced=True):
         selected = [slots[i] for i in range(0, len(slots), step)][:limit]
     return [s.strftime("%d/%m/%Y %H:%M") for s in selected]
 
-# --- Fechas en español ---
-_WEEK_MAP = {
-    "lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2,
-    "jueves": 3, "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6
-}
+# --- Fechas: parser natural con fallback a extractor propio ---
 def extract_spanish_date(text: str, today: date) -> date | None:
-    t = (text or "").lower()
-    if "pasado mañana" in t:
+    """
+    Fallback simple:
+      - "hoy", "mañana", "pasado mañana"
+      - días de la semana → próxima ocurrencia
+      - dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy
+      - "dd mes yyyy" o "dd de mes de yyyy" (mes en español)
+    """
+    if not text:
+        return None
+
+    t_raw = (text or "").strip().lower()
+    t = unicodedata.normalize("NFD", t_raw)
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
+
+    if "pasado manana" in t:
         return today + timedelta(days=2)
-    if "mañana" in t:
+    if "manana" in t:
         return today + timedelta(days=1)
     if "hoy" in t:
         return today
+
+    _WEEK_MAP = {
+        "lunes": 0, "martes": 1, "miercoles": 2,
+        "jueves": 3, "viernes": 4, "sabado": 5, "domingo": 6
+    }
     for w, idx in _WEEK_MAP.items():
         if re.search(rf"\b{w}\b", t):
             delta = (idx - today.weekday()) % 7
             if delta == 0:
                 delta = 7
             return today + timedelta(days=delta)
+
+    m = re.search(r"\b([0-3]?\d)[/\-\.]([01]?\d)[/\-\.](\d{4})\b", t)
+    if m:
+        d_, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(y, mth, d_)
+        except ValueError:
+            return None
+
+    meses = {
+        "enero":1, "febrero":2, "marzo":3, "abril":4, "mayo":5, "junio":6,
+        "julio":7, "agosto":8, "septiembre":9, "setiembre":9,
+        "octubre":10, "noviembre":11, "diciembre":12
+    }
+    m2 = re.search(r"\b([0-3]?\d)\s*(?:de\s+)?([a-z]+)\s*(?:de\s+)?(\d{4})\b", t)
+    if m2:
+        d__ = int(m2.group(1)); mes_txt = m2.group(2); y = int(m2.group(3))
+        if mes_txt in meses:
+            try:
+                return date(y, meses[mes_txt], d__)
+            except ValueError:
+                return None
+
     try:
-        dt = dtparser.parse(t, dayfirst=True, fuzzy=True)
+        dt = dtparser.parse(t_raw, dayfirst=True, fuzzy=True)
         return dt.date()
     except Exception:
         return None
 
+def parse_natural_date(text: str, today: date) -> date | None:
+    """
+    Intenta entender fechas naturales en español con dateparser.
+    Prefiere fechas futuras; si falla, usa el extractor fallback.
+    """
+    try:
+        dt = dp_parse(
+            text or "",
+            languages=["es"],
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": datetime.combine(today, datetime.min.time()),
+                "DATE_ORDER": "DMY",
+            },
+        )
+        if dt:
+            return dt.date()
+    except Exception:
+        pass
+    return extract_spanish_date(text, today)
+
 router = APIRouter(prefix="", tags=["webhooks"])
 
+# ----------------------------
+# Webhook principal
+# ----------------------------
 @router.post("/webhooks/whatsapp", response_class=PlainTextResponse)
 async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     if not From:
@@ -224,17 +306,18 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     raw_text = Body or ""
     text = normalize(raw_text)
 
-    # 0) Si hay una cita RESERVADA y falta nombre → pedir nombre o confirmar
+    # 0) Si hay una cita RESERVADA y falta nombre → pedir nombre
     for db in db_session():
         patient = get_patient_by_contact(db, From)
         pending = find_latest_reserved_for_contact(db, From) if patient else None
         if patient and pending and (patient.name is None or not patient.name.strip()):
-            send_text(From, "Para finalizar, ¿me comparte el nombre y apellido del paciente?")
+            send_text(From, polish(generate_reply("need_name", {})))
             return ""
 
-    # 1) Saludo humano formal (según hora)
+    # 1) Saludo humano (según hora)
     if text in ("hola","buenas","menu","menú","buenos dias","buenas tardes","buenas noches"):
-        send_text(From, generate_reply("greet", {"now": datetime.now()}))
+        msg = generate_reply("greet", {"now": datetime.now()})
+        send_text(From, polish(msg))
         return ""
 
     # Atajo: si el usuario escribe solo hora
@@ -244,47 +327,63 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     awaiting_keep = ctx.get("await_keep_date", False)
     awaiting_new_date = ctx.get("await_new_date", False)
 
-    # Manejo de sí/no para mantener fecha al reprogramar
+    # ======= Reprogramar: mantener fecha (sí/no) =======
     if awaiting_keep:
         if is_yes(raw_text):
             keep_date = ctx.get("pending_date")
-            pending_time = ctx.get("pending_time")
+            pending_time = ctx.get("pending_time")  # (h,m) o None
             clear_ctx_flags(From, "await_keep_date")
             if not keep_date:
-                send_text(From, generate_reply("ask_date_strict"))
+                send_text(From, polish(generate_reply("ask_date_strict", {})))
                 return ""
             if not pending_time:
                 update_ctx(From, last_date=keep_date)
-                send_text(From, generate_reply("confirm_date_time", {"date_dt": datetime.combine(keep_date, datetime.min.time())}))
+                # pedir hora listando opciones
+                for db in db_session():
+                    slots = available_slots(db, keep_date, settings.TIMEZONE)
+                    if not slots:
+                        send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(keep_date, datetime.min.time())})))
+                        break
+                    alts = human_slot_strings(slots, limit=12, balanced=True)
+                    send_text(From, polish(generate_reply("list_slots_for_date", {
+                        "date_dt": datetime.combine(keep_date, datetime.min.time()),
+                        "slots_list": alts
+                    })))
                 return ""
+            # tenemos fecha+hora → intentar mover/crear
             target_h, target_m = pending_time
             for db in db_session():
                 slots = available_slots(db, keep_date, settings.TIMEZONE)
                 if not slots:
-                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(keep_date, datetime.min.time())}))
+                    send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(keep_date, datetime.min.time())})))
                     break
                 match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
                 patient = get_or_create_patient(db, From)
                 if match:
                     appt = move_or_create_appointment(db, patient, match)
                     SESSION_CTX.pop(From, None)
-                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
+                    send_text(From, polish(generate_reply("reserved_ok", {"appt_dt": appt.start_at})))
                 else:
                     alts = human_slot_strings(slots, limit=12, balanced=False)
                     set_ctx(From, keep_date)
-                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(keep_date, datetime.min.time()), "slots_list": alts}))
+                    send_text(From, polish(generate_reply(
+                        "time_unavailable",
+                        {"date_dt": datetime.combine(keep_date, datetime.min.time()), "slots_list": alts}
+                    )))
             return ""
         if is_no(raw_text):
             clear_ctx_flags(From, "await_keep_date")
             update_ctx(From, await_new_date=True)
-            send_text(From, generate_reply("ask_date_strict"))
+            send_text(From, polish(generate_reply("ask_date_strict", {})))
             return ""
 
+    # ======= Reprogramar: esperando nueva fecha =======
     if awaiting_new_date:
         today_local = datetime.now().date()
-        parsed_new_date = extract_spanish_date(raw_text, today_local)
+        parsed_new_date = parse_natural_date(raw_text, today_local)
         if not parsed_new_date:
-            send_text(From, generate_reply("ask_date_strict"))
+            # pedir de nuevo fecha (opción estricta para reducir errores)
+            send_text(From, polish(generate_reply("ask_date_strict", {})))
             return ""
         pending_time = ctx.get("pending_time")
         if pending_time:
@@ -292,7 +391,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             for db in db_session():
                 slots = available_slots(db, parsed_new_date, settings.TIMEZONE)
                 if not slots:
-                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time())}))
+                    send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time())})))
                     break
                 match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
                 patient = get_or_create_patient(db, From)
@@ -300,23 +399,29 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     appt = move_or_create_appointment(db, patient, match)
                     clear_ctx_flags(From, "await_new_date", "pending_time")
                     SESSION_CTX[From]["last_date"] = parsed_new_date
-                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
+                    send_text(From, polish(generate_reply("reserved_ok", {"appt_dt": appt.start_at})))
                 else:
                     alts = human_slot_strings(slots, limit=12, balanced=False)
                     set_ctx(From, parsed_new_date)
                     clear_ctx_flags(From, "await_new_date")
-                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time()), "slots_list": alts}))
+                    send_text(From, polish(generate_reply(
+                        "time_unavailable",
+                        {"date_dt": datetime.combine(parsed_new_date, datetime.min.time()), "slots_list": alts}
+                    )))
             return ""
         # sin hora → mostrar lista y pedir hora
         for db in db_session():
             slots = available_slots(db, parsed_new_date, settings.TIMEZONE)
             if not slots:
-                send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time())}))
+                send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time())})))
                 break
             alts = human_slot_strings(slots, limit=12, balanced=True)
             set_ctx(From, parsed_new_date)
             clear_ctx_flags(From, "await_new_date")
-            send_text(From, generate_reply("list_slots_for_date", {"date_dt": datetime.combine(parsed_new_date, datetime.min.time()), "slots_list": alts}))
+            send_text(From, polish(generate_reply(
+                "list_slots_for_date",
+                {"date_dt": datetime.combine(parsed_new_date, datetime.min.time()), "slots_list": alts}
+            )))
         return ""
 
     # 2) NLU
@@ -330,20 +435,20 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
     nlu_date = entities.get("date") or ""
     topic = entities.get("topic") or ""
 
-    # Despedidas
+    # Despedidas cortas
     if text in ("no","no gracias","gracias","listo","es todo","ninguno","ninguna"):
-        send_text(From, generate_reply("goodbye"))
+        send_text(From, polish(generate_reply("goodbye", {})))
         return ""
 
-    # Información
+    # Información (precios/ubicación)
     if intent == "info" and not explicit_time_pre:
         if topic in ("costos","costo","precio","precios"):
-            send_text(From, generate_reply("prices"))
+            send_text(From, polish(generate_reply("prices", {})))
             return ""
         if topic in ("ubicacion","ubicación","direccion","dirección"):
-            send_text(From, "Estamos en **CLIEMED**, Av. Prof. Moisés Sáenz 1500, Leones, 64600, Monterrey, N.L.")
+            send_text(From, polish(generate_reply("location", {})))
             return ""
-        send_text(From, reply or "¿Desea costos o ubicación?")
+        send_text(From, polish(reply or "¿Desea costos o ubicación?"))
         return ""
 
     # Confirmar
@@ -351,11 +456,11 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         for db in db_session():
             appt = find_latest_reserved_for_contact(db, From)
             if not appt:
-                send_text(From, "Para confirmar necesito un horario reservado. ¿Desea que le proponga horarios?")
+                send_text(From, polish("Para confirmar necesito un horario reservado. ¿Desea que le proponga horarios?"))
                 break
             patient = get_patient_by_contact(db, From)
             if patient and (not patient.name or not patient.name.strip()):
-                send_text(From, "Antes de confirmar, ¿me comparte el nombre y apellido del paciente?")
+                send_text(From, polish(generate_reply("need_name", {})))
                 break
             appt.status = models.AppointmentStatus.confirmed
             if not appt.event_id:
@@ -371,7 +476,8 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 except Exception:
                     pass
             db.commit()
-            send_text(From, f"Confirmado. Quedó para {appt.start_at.strftime('%d/%m/%Y %H:%M')}. ¿Le ayudo con algo más?")
+            msg = generate_reply("confirm_done", {"appt_dt": appt.start_at, "patient_name": (patient.name if patient else "")})
+            send_text(From, polish(msg))
         return ""
 
     # Cancelar
@@ -379,7 +485,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         for db in db_session():
             appt = find_latest_active_for_contact(db, From)
             if not appt:
-                send_text(From, "No encuentro una cita activa. Si gusta, puedo ayudarle a agendar una nueva.")
+                send_text(From, polish("No encuentro una cita activa. Si gusta, puedo ayudarle a agendar una nueva."))
                 break
             appt.status = models.AppointmentStatus.canceled
             if appt.event_id:
@@ -389,7 +495,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                     pass
                 appt.event_id = None
             db.commit()
-            send_text(From, "Listo, quedó cancelada. ¿Desea revisar fechas para reprogramar?")
+            send_text(From, polish(generate_reply("canceled_ok", {})))
         return ""
 
     # Agendar / Reprogramar
@@ -398,22 +504,23 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         parsed_date = None
 
         if nlu_date:
-            parsed_date = extract_spanish_date(raw_text, today_local)
+            parsed_date = parse_natural_date(nlu_date, today_local)
         if not parsed_date:
-            parsed_date = extract_spanish_date(raw_text, today_local)
+            parsed_date = parse_natural_date(raw_text, today_local)
 
         explicit_time = parse_time_hint(raw_text)
 
-        # Solo hora y hay cita activa → preguntar si mantiene fecha
+        # Solo hora y hay cita activa → confirmar si mantiene fecha
         if intent in ("reschedule","book") and explicit_time and not parsed_date:
             for db in db_session():
                 appt = find_latest_active_for_contact(db, From)
                 if appt:
                     appt_date = appt.start_at.date()
                     update_ctx(From, await_keep_date=True, pending_date=appt_date, pending_time=explicit_time)
-                    send_text(From, f"¿Desea mantener la fecha del {appt_date.strftime('%d/%m/%Y')} y cambiar solo la hora? (sí/no)")
+                    msg = generate_reply("keep_same_date_q", {"date_dt": datetime.combine(appt_date, datetime.min.time())})
+                    send_text(From, polish(msg))
                     return ""
-            send_text(From, generate_reply("ask_date_strict"))
+            send_text(From, polish(generate_reply("ask_date_strict", {})))
             return ""
 
         # Si hay hora y tenemos fecha en contexto → usarla
@@ -426,16 +533,19 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             for db in db_session():
                 slots = available_slots(db, parsed_date, settings.TIMEZONE)
                 if not slots:
-                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_date, datetime.min.time())}))
+                    send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(parsed_date, datetime.min.time())})))
                     break
                 alts = human_slot_strings(slots, limit=12, balanced=True)
                 set_ctx(From, parsed_date)
-                send_text(From, generate_reply("list_slots_for_date", {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}))
+                send_text(From, polish(generate_reply(
+                    "list_slots_for_date",
+                    {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}
+                )))
             return ""
 
-        # Caso B: hora sí, fecha no → pedir fecha
+        # Caso B: hora sí, fecha no → pedir fecha (estricto)
         if explicit_time and not parsed_date:
-            send_text(From, generate_reply("ask_date_strict"))
+            send_text(From, polish(generate_reply("ask_date_strict", {})))
             return ""
 
         # Caso C: fecha sí y hora sí → reservar
@@ -444,27 +554,34 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
             for db in db_session():
                 slots = available_slots(db, parsed_date, settings.TIMEZONE)
                 if not slots:
-                    send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(parsed_date, datetime.min.time())}))
+                    send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(parsed_date, datetime.min.time())})))
                     break
                 match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
                 patient = get_or_create_patient(db, From)
                 if match:
                     appt = move_or_create_appointment(db, patient, match)
                     SESSION_CTX.pop(From, None)
-                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
+                    send_text(From, polish(generate_reply("reserved_ok", {"appt_dt": appt.start_at})))
                 else:
                     alts = human_slot_strings(slots, limit=12, balanced=False)
                     set_ctx(From, parsed_date)
-                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}))
+                    send_text(From, polish(generate_reply(
+                        "time_unavailable",
+                        {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}
+                    )))
             return ""
 
-        # Caso D: falta info
-        send_text(From, generate_reply("ask_date_strict"))
+        # Caso D: falta info → pedir fecha (estricto)
+        send_text(From, polish(generate_reply("ask_date_strict", {})))
         return ""
 
-    # Smalltalk por NLU (si llega)
+    # Smalltalk / saludo por NLU
     if intent in ("smalltalk","greet"):
-        send_text(From, generate_reply("greet", {"now": datetime.now()}))
+        if reply:
+            send_text(From, polish(reply))
+            return ""
+        msg = generate_reply("greet", {"now": datetime.now()})
+        send_text(From, polish(msg))
         return ""
 
     # Parser natural (último recurso)
@@ -476,7 +593,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
         for db in db_session():
             slots = available_slots(db, d, settings.TIMEZONE)
             if not slots:
-                send_text(From, generate_reply("day_full", {"date_dt": datetime.combine(d, datetime.min.time())}))
+                send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(d, datetime.min.time())})))
                 break
             if has_time_hint:
                 target_h = dt.hour; target_m = dt.minute
@@ -485,19 +602,25 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)):
                 if match:
                     appt = move_or_create_appointment(db, patient, match)
                     SESSION_CTX.pop(From, None)
-                    send_text(From, generate_reply("reserved_ok", {"appt_dt": appt.start_at}))
+                    send_text(From, polish(generate_reply("reserved_ok", {"appt_dt": appt.start_at})))
                 else:
                     alts = human_slot_strings(slots, limit=12, balanced=False)
                     set_ctx(From, d)
-                    send_text(From, generate_reply("time_unavailable", {"date_dt": datetime.combine(d, datetime.min.time()), "slots_list": alts}))
+                    send_text(From, polish(generate_reply(
+                        "time_unavailable",
+                        {"date_dt": datetime.combine(d, datetime.min.time()), "slots_list": alts}
+                    )))
             else:
                 alts = human_slot_strings(slots, limit=12, balanced=True)
                 set_ctx(From, d)
-                send_text(From, generate_reply("list_slots_for_date", {"date_dt": datetime.combine(d, datetime.min.time()), "slots_list": alts}))
+                send_text(From, polish(generate_reply(
+                    "list_slots_for_date",
+                    {"date_dt": datetime.combine(d, datetime.min.time()), "slots_list": alts}
+                )))
         return ""
     except Exception:
         pass
 
     # Fallback final
-    send_text(From, generate_reply("fallback"))
+    send_text(From, polish(generate_reply("fallback", {})))
     return ""
