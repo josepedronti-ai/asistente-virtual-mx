@@ -14,10 +14,18 @@ class Settings(BaseSettings):
     # ===== App =====
     APP_NAME: str = "asistente_virtual"
     ENV: str = "dev"
-    TIMEZONE: str = "America/Mexico_City"
+    # TZ local del consultorio
+    TIMEZONE: str = "America/Monterrey"
 
     # ===== DB =====
+    # En Render define DATABASE_URL con tu Postgres. Local puede caer a SQLite.
     DATABASE_URL: str = "sqlite:///./asistente.db"
+
+    # Opciones de pool (puedes sobreescribir en Render → Environment)
+    DB_POOL_SIZE: int = 2
+    DB_MAX_OVERFLOW: int = 5
+    DB_POOL_TIMEOUT: int = 30
+    DB_POOL_RECYCLE: int = 1800  # 30 min
 
     # ===== Twilio =====
     TWILIO_ACCOUNT_SID: Optional[str] = None
@@ -25,27 +33,29 @@ class Settings(BaseSettings):
     TWILIO_WHATSAPP_FROM: Optional[str] = None
     TWILIO_TEST_TO: Optional[str] = None
 
-    # Simular envíos (no manda mensajes reales si True)
+    # Simulación (True = no envía mensajes reales)
     DRY_RUN: bool = False
 
     # ===== Google Calendar (Service Account) =====
-    # Lo que usa scheduling.py:
     GCAL_CALENDAR_ID: str = "primary"
-    # Puede ser:
-    #   - JSON completo en una sola línea (con \n escapados)
-    #   - Ruta a archivo JSON (p.ej. "credentials.json")
+    # Puede ser JSON (una sola línea) o ruta a archivo .json
     GCAL_SA_JSON: Optional[str] = None
-    # Opcional (solo si usas Workspace y delegación)
+    # Opcional si usas delegación en Workspace
     GCAL_IMPERSONATE_EMAIL: Optional[str] = None
 
     # ===== Horario de consultorio y slots =====
-    CLINIC_START_HOUR: int = 9
-    CLINIC_END_HOUR: int = 18
+    # Nombres “nuevos”
+    CLINIC_OPEN_HOUR: int = 16    # 16:00
+    CLINIC_CLOSE_HOUR: int = 22   # 22:00
     SLOT_MINUTES: int = 30
     EVENT_DURATION_MIN: int = 30
 
-    # ====== Compatibilidad hacia atrás (variables antiguas) ======
-    # Si aún tienes GOOGLE_* en tu .env, los mapeamos automáticamente.
+    # ===== Compatibilidad hacia atrás =====
+    # Nombres “antiguos” por si tu código los usaba en algún punto
+    CLINIC_START_HOUR: int = 16
+    CLINIC_END_HOUR: int = 22
+
+    # Compat con variables GOOGLE_*
     GOOGLE_CALENDAR_ID: Optional[str] = None
     GOOGLE_CREDENTIALS_FILE: Optional[str] = None
     GOOGLE_TOKEN_FILE: Optional[str] = None
@@ -53,8 +63,9 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context) -> None:
         """
-        Backfill automático desde GOOGLE_* → GCAL_* si las nuevas no están definidas.
-        Esto permite migrar sin romper la configuración existente.
+        Backfill de:
+          - GOOGLE_* → GCAL_*
+          - START/END ↔ OPEN/CLOSE (ambos nombres quedan válidos)
         """
         # Calendar ID
         if (not self.GCAL_CALENDAR_ID or self.GCAL_CALENDAR_ID == "primary") and self.GOOGLE_CALENDAR_ID:
@@ -65,11 +76,17 @@ class Settings(BaseSettings):
             if self.GOOGLE_CREDENTIALS_JSON:
                 self.GCAL_SA_JSON = self.GOOGLE_CREDENTIALS_JSON.strip()
             elif self.GOOGLE_CREDENTIALS_FILE:
-                # Guardamos la RUTA, scheduling.py sabrá leer archivo o JSON
-                p = Path(self.GOOGLE_CREDENTIALS_FILE)
-                # No validamos existencia aquí; scheduling.py manejará errores mejor
-                self.GCAL_SA_JSON = str(p)
+                self.GCAL_SA_JSON = str(Path(self.GOOGLE_CREDENTIALS_FILE))
 
-        # No necesitamos GOOGLE_TOKEN_FILE con Service Account, se ignora.
+        # Alias horarios: si alguien cambió un set y no el otro, reflejamos a ambos
+        if self.CLINIC_OPEN_HOUR != self.CLINIC_START_HOUR:
+            # si difieren, homogeniza a OPEN/CLOSE
+            self.CLINIC_START_HOUR = self.CLINIC_OPEN_HOUR
+            self.CLINIC_END_HOUR = self.CLINIC_CLOSE_HOUR
+        else:
+            # si OPEN/CLOSE no fue seteado explícitamente pero START/END sí
+            self.CLINIC_OPEN_HOUR = self.CLINIC_START_HOUR
+            self.CLINIC_CLOSE_HOUR = self.CLINIC_END_HOUR
+
 
 settings = Settings()
