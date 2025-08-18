@@ -407,6 +407,32 @@ def move_or_create_appointment(db: Session, patient: models.Patient, start_dt: d
     db.refresh(appt)
     return appt
 
+def _has_date_tokens(text: str) -> bool:
+    """
+    Devuelve True solo si el texto tiene señales claras de FECHA.
+    Evita que "8 pm" sea interpretado como 'hoy a las 8'.
+    """
+    t = (text or "").strip().lower()
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
+
+    # palabras relativas
+    if re.search(r"\b(hoy|manana|pasado manana)\b", t):
+        return True
+
+    # días de la semana con modificadores comunes
+    if re.search(r"\b(este|proximo|proximo|siguiente)?\s*(lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b", t):
+        return True
+
+    # meses o formato dd/mm(/yyyy), dd-mm, "18 de agosto"
+    if re.search(r"\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b", t):
+        return True
+    if re.search(r"\b([0-3]?\d)\s*(?:/|-|\.)\s*([01]?\d)(?:\s*(?:/|-|\.)\s*\d{2,4})?\b", t):
+        return True
+    if re.search(r"\b([0-3]?\d)\s*(?:de\s+)?[a-z]+(?:\s+de\s+\d{4})?\b", t):
+        return True
+
+    return False
 
 router = APIRouter(prefix="", tags=["webhooks"])
 
@@ -522,57 +548,79 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
 
     # --------- AWAIT_TIME: esperar hora ---------
     if state == "await_time":
-        locked_date = ctx.get("last_date")
-        if not locked_date:
-            send_text(From, polish(generate_reply("ask_date_strict", {})))
-            _set_state(From, "await_date")
-            return ""
+        # ¿El usuario está cambiando la FECHA aquí? (solo si hay tokens claros de fecha)
+        if _has_date_tokens(raw_text):
+            today = datetime.now().date()
+            new_date = parse_natural_date(raw_text, today)
+            if new_date and (new_date != ctx.get("last_date")):
+                for db in db_session():
+                    slots = available_slots(db, new_date, settings.TIMEZONE)
+                    if not slots:
+                        send_text(From, polish(generate_reply("day_full", {
+                            "date_dt": datetime.combine(new_date, datetime.min.time())
+                        })))
+                        _set_state(From, "await_date")
+                        break
+                    alts = human_slot_strings(slots, limit=12, balanced=True)
+                    send_text(From, polish(generate_reply(
+                        "list_slots_for_date",
+                        {"date_dt": datetime.combine(new_date, datetime.min.time()), "slots_list": alts}
+                    )))
+                _set_state(From, "await_time", last_date=new_date)
+                return ""
 
-        # ¿cambió de fecha aquí en lugar de dar hora?
-        today = datetime.now().date()
-        new_date = parse_natural_date(raw_text, today)
-        if new_date and (new_date != locked_date):
-            _send_slots_for(From, new_date)
-            _set_state(From, "await_time", last_date=new_date)
-            return ""
-
-        # esperar solo hora para la fecha BLOQUEADA
+        # En este estado, si no cambió fecha, esperamos SOLO la hora
         time_hint = parse_time_hint(raw_text)
-        print(f"[TIME PARSE] raw='{raw_text}' -> {time_hint}")
         if not time_hint:
             send_text(
                 From,
                 polish(
                     "Gracias. Para continuar, ¿me indica la hora que prefiere? "
-                    "Puede escribirla como 16:00, 4 pm u “ocho de la tarde”."
+                    "Puede escribirla como **16:00**, **4 pm** u **“ocho de la tarde”**."
                 ),
             )
-            _send_slots_for(From, locked_date)
             return ""
 
         target_h, target_m = time_hint
+        parsed_date = ctx.get("last_date")
+        if not parsed_date:
+            # Seguridad: si por alguna razón no hay fecha en contexto, la pedimos
+            send_text(From, polish(generate_reply("ask_date_strict", {})))
+            _set_state(From, "await_date")
+            return ""
 
+        # Buscar si esa hora existe para la fecha elegida
         for db in db_session():
-            slots = available_slots(db, locked_date, settings.TIMEZONE)
+            slots = available_slots(db, parsed_date, settings.TIMEZONE)
             if not slots:
-                send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(locked_date, datetime.min.time())})))
+                send_text(
+                    From,
+                    polish(generate_reply("day_full", {
+                        "date_dt": datetime.combine(parsed_date, datetime.min.time())
+                    }))
+                )
                 _set_state(From, "await_date")
                 break
 
             match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
             if match:
+                # Pedimos confirmación (no calendar todavía)
                 try:
                     send_text(From, polish(generate_reply("confirm_q", {"appt_dt": match})))
                 except Exception:
                     when = f"{match.strftime('%d/%m/%Y')} a las {match.strftime('%H:%M')}"
                     send_text(From, polish(f"Para confirmar, sería el {when}. ¿Es correcto?"))
-                _set_state(From, "await_confirm", last_date=locked_date, last_time=(target_h, target_m))
+                _set_state(From, "await_confirm", last_date=parsed_date, last_time=(target_h, target_m))
             else:
+                # Ofrecer alternativas del mismo día
                 alts = human_slot_strings(slots, limit=12, balanced=False)
-                send_text(From, polish(generate_reply(
-                    "time_unavailable",
-                    {"date_dt": datetime.combine(locked_date, datetime.min.time()), "slots_list": alts}
-                )))
+                send_text(
+                    From,
+                    polish(generate_reply(
+                        "time_unavailable",
+                        {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}
+                    ))
+                )
         return ""
 
     # --------- AWAIT_DATE: esperar fecha ---------
