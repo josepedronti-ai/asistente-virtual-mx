@@ -98,16 +98,29 @@ def parse_time_hint(text: str):
     """
     Extrae hora explícita de expresiones comunes:
       - "20:00", "20.00", "20 00"
-      - "8 pm", "8pm", "8:00pm", "8.00 pm"
+      - "8 pm", "8pm", "8:00 pm", "8.00pm"
       - "20 h", "20 hrs", "20 horas"
-      - "ocho de la noche/tarde/mañana/madrugada"
+      - "a las 8", "8 en punto"
+      - "ocho de la mañana/tarde/noche/madrugada"
+      - "ocho y media / y cuarto / menos cuarto"
       - "mediodía", "medianoche"
     Devuelve (hour, minute) o None.
     """
     t = (text or "").strip().lower()
+    # normaliza acentos
     t_norm = unicodedata.normalize("NFD", t)
     t_norm = "".join(ch for ch in t_norm if unicodedata.category(ch) != "Mn")
+    # compacta espacios
     t_norm = re.sub(r"\s+", " ", t_norm)
+
+    # --- guardas para no confundir con fechas ---
+    if re.search(r"\b\d{1,2}\s*[/\-]\s*\d{1,2}\b", t_norm):
+        # hay un dd/mm o dd-mm → evita tomar un número suelto como hora
+        pass
+    elif re.search(r"\b\d{1,2}\s*[/\-]\s*\d{1,2}\s*[/\-]\s*\d{2,4}\b", t_norm):
+        pass
+    elif re.search(r"\b\d{1,2}\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b", t_norm):
+        pass
 
     # atajos especiales
     if re.search(r"\bmediodia\b", t_norm):
@@ -115,7 +128,7 @@ def parse_time_hint(text: str):
     if re.search(r"\bmedianoche\b", t_norm):
         return 0, 0
 
-    # 1) hh:mm (opcional am/pm) — ":" "." o espacio como separador
+    # 1) hh:mm / hh.mm / hh mm (opcional am/pm)
     m = re.search(r"\b([01]?\d|2[0-3])\s*[:\. ]\s*([0-5]\d)\s*(am|pm)?\b", t_norm)
     if m:
         h = int(m.group(1)); mnt = int(m.group(2)); ampm = (m.group(3) or "").lower()
@@ -123,7 +136,7 @@ def parse_time_hint(text: str):
         if ampm == "am" and h == 12: h = 0
         return h, mnt
 
-    # 2) h am/pm
+    # 2) h am/pm (8 pm)
     m = re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t_norm)
     if m:
         h = int(m.group(1)); ampm = m.group(2)
@@ -131,20 +144,25 @@ def parse_time_hint(text: str):
         if ampm == "am" and h == 12: h = 0
         return h, 0
 
-    # 3) h[:.]mm con am/pm pegado (8:00pm, 8.00pm)
-    m = re.search(r"\b([1-9]|1[0-2])\s*[:\.]\s*([0-5]\d)\s*(?:pm|am)\b", t_norm)
+    # 3) h[:.]mm con am/pm pegado o separado (8:00pm / 8.00 pm)
+    m = re.search(r"\b([1-9]|1[0-2])\s*[:\.]\s*([0-5]\d)\s*(am|pm)\b", t_norm)
     if m:
-        h = int(m.group(1)); mnt = int(m.group(2))
-        ampm = "pm" if "pm" in t_norm[m.end()-2:m.end()] else "am"
+        h = int(m.group(1)); mnt = int(m.group(2)); ampm = m.group(3)
+        if ampm == "pm" and h != 12: h += 12
+        if ampm == "am" and h == 12: h = 0
+        return h, mnt
+    m = re.search(r"\b([1-9]|1[0-2])\s*[:\.]\s*([0-5]\d)(am|pm)\b", t_norm)  # sin espacio
+    if m:
+        h = int(m.group(1)); mnt = int(m.group(2)); ampm = m.group(3)
         if ampm == "pm" and h != 12: h += 12
         if ampm == "am" and h == 12: h = 0
         return h, mnt
 
-    # 4) “8 de la tarde/noche/mañana/madrugada”
-    m = re.search(r"\b([1-9]|1[0-2])\s*(?:de\s+la\s+)?(manana|mañana|tarde|noche|madrugada)\b", t_norm)
+    # 4) “8 de la mañana/tarde/noche/madrugada”
+    m = re.search(r"\b([1-9]|1[0-2])\s*(?:de\s+la\s+)?(manana|tarde|noche|madrugada)\b", t_norm)
     if m:
         h = int(m.group(1)); per = m.group(2)
-        if per in ("manana","mañana"):
+        if per == "manana":
             if h == 12: h = 0
         elif per in ("tarde", "noche"):
             if h != 12: h += 12
@@ -152,16 +170,24 @@ def parse_time_hint(text: str):
             if h == 12: h = 0
         return h, 0
 
-    # 5) palabras (uno..doce) + franja
+    # 5) “a las 8” / “8 en punto”
+    m = re.search(r"(?:a\s+las\s+)?\b(0?\d|1\d|2[0-3])\b(?:\s*(?:en\s+punto))?$", t_norm)
+    if m:
+        return int(m.group(1)), 0
+
+    # 6) palabras (uno..doce) [+ franja]
     palabras = {
         "una":1, "uno":1, "dos":2, "tres":3, "cuatro":4, "cinco":5, "seis":6,
         "siete":7, "ocho":8, "nueve":9, "diez":10, "once":11, "doce":12
     }
-    w = re.search(r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b(?:.*?\bde la\b\s+(manana|mañana|tarde|noche|madrugada))?", t_norm)
+    w = re.search(
+        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?",
+        t_norm
+    )
     if w:
         h = palabras[w.group(1)]
         franja = w.group(2) or ""
-        if franja in ("manana","mañana"):
+        if franja == "manana":
             if h == 12: h = 0
         elif franja in ("tarde", "noche"):
             if h != 12: h += 12
@@ -169,9 +195,9 @@ def parse_time_hint(text: str):
             if h == 12: h = 0
         return h, 0
 
-    # 6) “y media / y cuarto / menos cuarto”
+    # 7) “y media / y cuarto / menos cuarto”
     m = re.search(
-        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+y\s+(media|cuarto)\b(?:.*?\bde la\b\s+(manana|mañana|tarde|noche|madrugada))?",
+        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+y\s+(media|cuarto)\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?",
         t_norm
     )
     if m:
@@ -179,7 +205,7 @@ def parse_time_hint(text: str):
         parte = m.group(2)
         franja = m.group(3) or ""
         minutes = 30 if parte == "media" else 15
-        if franja in ("manana","mañana"):
+        if franja == "manana":
             if h == 12: h = 0
         elif franja in ("tarde", "noche"):
             if h != 12: h += 12
@@ -188,14 +214,14 @@ def parse_time_hint(text: str):
         return h, minutes
 
     m = re.search(
-        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+menos\s+cuarto\b(?:.*?\bde la\b\s+(manana|mañana|tarde|noche|madrugada))?",
+        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+menos\s+cuarto\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?",
         t_norm
     )
     if m:
         h = palabras[m.group(1)]
         franja = m.group(2) or ""
         h = (h - 1) if h > 1 else 12
-        if franja in ("manana","mañana"):
+        if franja == "manana":
             if h == 12: h = 0
         elif franja in ("tarde", "noche"):
             if h != 12: h += 12
@@ -203,12 +229,12 @@ def parse_time_hint(text: str):
             if h == 12: h = 0
         return h, 45
 
-    # 7) “20 h / 20 hrs / 20 horas”
+    # 8) “20 h / 20 hrs / 20 horas”
     m = re.search(r"\b(0?\d|1\d|2[0-3])\s*(?:h|hrs|horas?)\b", t_norm)
     if m:
         return int(m.group(1)), 0
 
-    # 8) solo “20”
+    # 9) último recurso: número suelto 0–23
     m = re.search(r"\b(0?\d|1\d|2[0-3])\b", t_norm)
     if m:
         return int(m.group(1)), 0

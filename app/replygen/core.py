@@ -37,6 +37,7 @@ def _list_as_line(items: List[str], limit: int = 12) -> str:
 # 1) Saludo (time-aware)
 def _greet(state: Dict[str, Any]) -> str:
     saludo = _time_greeting(state.get("now"))
+    # salida exacta pedida:
     return f"Hola, {saludo}. Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?"
 
 # 2) Pedir fecha (suave, primera vez)
