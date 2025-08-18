@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     GOOGLE_TOKEN_FILE: Optional[str] = None
     GOOGLE_CREDENTIALS_JSON: Optional[str] = None
 
+    # ===== Admin =====
+    ADMIN_TOKEN: Optional[str] = None
+
     def model_post_init(self, __context) -> None:
         """
         Backfill de:
