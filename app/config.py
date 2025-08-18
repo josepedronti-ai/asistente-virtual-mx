@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "asistente_virtual"
     ENV: str = "dev"
     # TZ local del consultorio
-    TIMEZONE: str = "America/Monterrey"
+    TIMEZONE: str = "America/Mexico_City"
 
     # ===== DB =====
     # En Render define DATABASE_URL con tu Postgres. Local puede caer a SQLite.
