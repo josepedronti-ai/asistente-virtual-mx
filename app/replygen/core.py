@@ -30,8 +30,9 @@ def _time_greeting(now: Optional[datetime] = None) -> str:
         return "buenas tardes"
     return "buenas noches"
 
-def _list_as_lines(items: List[str], limit: int = 12) -> str:
-    return "\n".join(items[:limit])
+def _list_as_line(items: List[str], limit: int = 12) -> str:
+    # Una sola línea separada por “ · ” para evitar columnas raras en WhatsApp
+    return " · ".join(items[:limit])
 
 # 1) Saludo (time-aware)
 def _greet(state: Dict[str, Any]) -> str:
@@ -40,25 +41,33 @@ def _greet(state: Dict[str, Any]) -> str:
 
 # 2) Pedir fecha (estricto, para reducir errores)
 def _ask_date_strict(state: Dict[str, Any]) -> str:
-    return "Claro, para agendar su cita, ¿me podría indicar la fecha exacta en formato Día/Mes/Año?"
+    return (
+        "Claro, para agendar su cita necesito la fecha exacta (formato Día/Mes/Año) para evitar confusiones. "
+        "¿Qué día le gustaría?"
+    )
 
 # 3) Listar horarios de una fecha
 def _list_slots_for_date(state: Dict[str, Any]) -> str:
     d: Optional[datetime] = state.get("date_dt")
     fecha = _fmt_date(d)
     slots: List[str] = state.get("slots_list") or []
-    lista = _list_as_lines(slots, limit=12)
-    return f"Perfecto. Para el {fecha} tengo disponibles los siguientes horarios:\n{lista}\n¿Cuál prefiere?"
+    if not slots:
+        return f"Para el {fecha} no tengo espacios disponibles. ¿Desea que le sugiera días cercanos?"
+    linea = _list_as_line(slots, limit=12)
+    return (
+        f"Perfecto. Para el {fecha} tengo disponibles estos horarios:\n"
+        f"{linea}\n"
+        "¿Cuál prefiere?"
+    )
 
-# 4) Confirmar fecha y hora (si lo llegas a usar)
-def _confirm_date_time(state: Dict[str, Any]) -> str:
-    d: Optional[datetime] = state.get("date_dt")
-    t: Optional[datetime] = state.get("time_dt") or d
-    fecha = _fmt_date(d)
-    hora  = _fmt_time(t)
+# 4) Confirmación de fecha y hora (pregunta)
+def _confirm_q(state: Dict[str, Any]) -> str:
+    dt = state.get("appt_dt")
+    fecha = _fmt_date(dt)
+    hora  = _fmt_time(dt)
     return f"Para confirmar, sería el 📅 {fecha} a las ⏰ {hora}. ¿Es correcto?"
 
-# 5) Reservado OK (respuesta tras reservar/mover)
+# 5) Reservado OK (si reservas sin pedir confirmación previa)
 def _reserved_ok(state: Dict[str, Any]) -> str:
     dt = state.get("appt_dt")
     fecha = _fmt_date(dt)
@@ -84,10 +93,10 @@ def _time_unavailable(state: Dict[str, Any]) -> str:
     slots: List[str] = state.get("slots_list") or []
     if not slots:
         return f"Lamentablemente ese horario ya está ocupado. ¿Desea que le sugiera otras horas para el {fecha}?"
-    lista = _list_as_lines(slots, limit=12)
+    linea = _list_as_line(slots, limit=12)
     return (
         "Lamentablemente ese horario ya está ocupado. "
-        f"Para el {fecha} tengo disponibles los siguientes horarios:\n{lista}\n"
+        f"Para el {fecha} tengo disponibles: {linea}.\n"
         "¿Desea que reserve alguno de ellos para usted?"
     )
 
@@ -113,11 +122,11 @@ def _prices(state: Dict[str, Any]) -> str:
 
 # 10) Despedida
 def _goodbye(state: Dict[str, Any]) -> str:
-    return "Perfecto, quedo a sus órdenes para cualquier duda o si desea agendar más adelante. Que tenga un excelente día."
+    return "Quedo a sus órdenes para cualquier duda o si desea agendar más adelante. Que tenga un excelente día."
 
 # 11) Solicitar nombre para cerrar reserva pendiente
 def _need_name(state: Dict[str, Any]) -> str:
-    return "Para finalizar, ¿me comparte el nombre y apellido del paciente?"
+    return "Para concluir, ¿podría compartir el nombre y apellido del paciente, por favor?"
 
 # 12) Confirmación exitosa (cuando se confirma una reserva existente)
 def _confirm_done(state: Dict[str, Any]) -> str:
@@ -125,8 +134,8 @@ def _confirm_done(state: Dict[str, Any]) -> str:
     fecha = _fmt_date(dt)
     hora  = _fmt_time(dt)
     nombre = (state.get("patient_name") or "").strip()
-    n = f" del paciente {nombre}" if nombre else ""
-    return f"Confirmado{n}. Quedó para el 📅 {fecha} a las ⏰ {hora}. ¿Le ayudo con algo más?"
+    n = f", {nombre}" if nombre else ""
+    return f"Confirmado{n}. Su cita quedó para el 📅 {fecha} a las ⏰ {hora}. ¿Le puedo ayudar con algo más?"
 
 # 13) Cancelación realizada
 def _canceled_ok(state: Dict[str, Any]) -> str:
@@ -144,7 +153,7 @@ def _keep_same_date_q(state: Dict[str, Any]) -> str:
 
 # Fallback
 def _fallback(state: Dict[str, Any]) -> str:
-    return "Disculpe, ¿desea agendar, cambiar/confirmar una cita o consultar precios/ubicación?"
+    return "Disculpe, ¿le gustaría agendar, cambiar o confirmar una cita, o consultar precios y ubicación?"
 
 # ==========================
 # Interfaz pública
@@ -153,7 +162,7 @@ _HANDLERS = {
     "greet": _greet,
     "ask_date_strict": _ask_date_strict,
     "list_slots_for_date": _list_slots_for_date,
-    "confirm_date_time": _confirm_date_time,
+    "confirm_q": _confirm_q,             # <-- NUEVA
     "reserved_ok": _reserved_ok,
     "day_full": _day_full,
     "time_unavailable": _time_unavailable,

@@ -22,7 +22,6 @@ from ..services.nlu import analizar
 from ..replygen.core import generate_reply
 from ..replygen.llm import polish_spanish_mx as polish  # pulido humano si hay OPENAI_API_KEY
 
-
 # =========================
 # Memoria corta (contexto)
 # =========================
@@ -191,7 +190,6 @@ def parse_natural_date(text: str, today: date) -> date | None:
         pass
     return extract_spanish_date(text, today)
 
-
 # ----------------------------
 # DB helpers
 # ----------------------------
@@ -254,9 +252,7 @@ def move_or_create_appointment(db: Session, patient: models.Patient, start_dt: d
     db.refresh(appt)
     return appt
 
-
 router = APIRouter(prefix="", tags=["webhooks"])
-
 
 # ----------------------------
 # Webhook principal (FSM primero, NLU después)
@@ -336,18 +332,15 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
         if last_date and last_time:
             h, m = last_time
             dummy_dt = datetime.combine(last_date, datetime.min.time()).replace(hour=h, minute=m)
-            try:
-                send_text(From, polish(generate_reply("confirm_q", {"appt_dt": dummy_dt})))
-            except Exception:
-                when = f"{dummy_dt.strftime('%d/%m/%Y')} a las {dummy_dt.strftime('%H:%M')}"
-                send_text(From, polish(f"Para confirmar, sería el {when}. ¿Es correcto?"))
+            send_text(From, polish(generate_reply("confirm_q", {"appt_dt": dummy_dt})))
         return ""
 
     # --------- AWAIT_TIME: esperar hora ---------
     if state == "await_time":
         time_hint = parse_time_hint(raw_text)
         if not time_hint:
-            send_text(From, polish("Por favor, indíqueme la hora que prefiere (por ejemplo 16:00)."))
+            # tono+
+            send_text(From, polish("Gracias. Para continuar, indíqueme por favor la hora que prefiere (por ejemplo, 16:00)."))
             return ""
         target_h, target_m = time_hint
         parsed_date = ctx.get("last_date")
@@ -364,11 +357,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
             match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
             if match:
                 # Pedimos confirmación (no calendar aún)
-                try:
-                    send_text(From, polish(generate_reply("confirm_q", {"appt_dt": match})))
-                except Exception:
-                    when = f"{match.strftime('%d/%m/%Y')} a las {match.strftime('%H:%M')}"
-                    send_text(From, polish(f"Para confirmar, sería el {when}. ¿Es correcto?"))
+                send_text(From, polish(generate_reply("confirm_q", {"appt_dt": match})))
                 _set_state(From, "await_confirm", last_date=parsed_date, last_time=(target_h, target_m))
             else:
                 alts = human_slot_strings(slots, limit=12, balanced=False)
@@ -383,7 +372,8 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
         today = datetime.now().date()
         parsed_date = parse_natural_date(raw_text, today)
         if not parsed_date:
-            send_text(From, polish(generate_reply("ask_date_strict", {})))
+            # tono+
+            send_text(From, polish("Gracias. Para continuar, compártame la fecha en formato Día/Mes/Año (ej. 18/08/2025)."))
             return ""
         for db in db_session():
             slots = available_slots(db, parsed_date, settings.TIMEZONE)
