@@ -91,3 +91,57 @@ def reset_contact(
     SESSION_CTX.pop(contact, None)
 
     return JSONResponse({"ok": True, "deleted": deleted})
+
+# --- Diagnóstico de Google Calendar ---
+from datetime import datetime, timedelta
+import pytz
+from ..services.scheduling import _get_service, CALENDAR_ID, TIMEZONE
+
+@router.get("/calendar/diag")
+def calendar_diag(_: bool = Depends(require_admin)):
+    """
+    Verifica que podemos leer el calendario y cuenta los 'busy' de hoy.
+    """
+    out = {"can_read": False, "calendar_summary": None, "tz": TIMEZONE, "freebusy_count_today": 0}
+    try:
+        svc = _get_service()
+        info = svc.calendars().get(calendarId=CALENDAR_ID).execute()
+        out["can_read"] = True
+        out["calendar_summary"] = info.get("summary")
+
+        tz = pytz.timezone(TIMEZONE)
+        start = tz.localize(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0))
+        end = start + timedelta(days=1)
+
+        fb = svc.freebusy().query(body={
+            "timeMin": start.isoformat(),
+            "timeMax": end.isoformat(),
+            "timeZone": TIMEZONE,
+            "items": [{"id": CALENDAR_ID}],
+        }).execute()
+        out["freebusy_count_today"] = len(fb["calendars"][CALENDAR_ID]["busy"])
+        return {"ok": True, **out}
+    except Exception as e:
+        return {"ok": False, "error": str(e), **out}
+
+@router.post("/calendar/mock")
+def calendar_mock(_: bool = Depends(require_admin)):
+    """
+    Crea y borra un evento de prueba para validar permisos de escritura.
+    """
+    try:
+        svc = _get_service()
+        tz = pytz.timezone(TIMEZONE)
+        start = tz.localize(datetime.now() + timedelta(minutes=10))
+        end = start + timedelta(minutes=30)
+        ev = svc.events().insert(calendarId=CALENDAR_ID, body={
+            "summary": "TEST — Asistente Virtual",
+            "start": {"dateTime": start.isoformat(), "timeZone": TIMEZONE},
+            "end": {"dateTime": end.isoformat(), "timeZone": TIMEZONE},
+            "description": "Evento de prueba creado por /admin/calendar/mock",
+        }).execute()
+        ev_id = ev["id"]
+        svc.events().delete(calendarId=CALENDAR_ID, eventId=ev_id).execute()
+        return {"ok": True, "created_then_deleted": True, "event_id": ev_id}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
