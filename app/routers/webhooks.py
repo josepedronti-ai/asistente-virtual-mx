@@ -72,38 +72,139 @@ def _clean_person_name(raw: str) -> str:
     return s.title()
 
 # Sí / No humanos
-_YES_PAT = re.compile(r"\b(s[ií]|claro|correcto|ok|vale|de acuerdo|afirmativo|me parece|est(a|á) bien|perfecto)\b")
-_NO_PAT  = re.compile(r"\b(no|prefiero cambiar|otra fecha|cambiar fecha|no gracias|mejor no)\b")
+_YES_PAT = re.compile(
+    r"(?:^|\b)(?:s[ií]|sí por favor|si por favor|claro(?: que s[ií])?|correcto|ok(?:ay)?|vale|de acuerdo|afirmativo|me parece|está bien|esta bien|perfecto|va|sale|adelante|funciona|me late|confirmo|confirmar|agendar|queda|listo)(?:\b|$)"
+)
+_NO_PAT = re.compile(
+    r"(?:^|\b)(?:no|no gracias|mejor no|no es correcto|no es asi|no es así|prefiero cambiar|otra fecha|cambiar fecha|cancela|cancelar|no puedo|no me queda|no me funciona)(?:\b|$)"
+)
+
 def is_yes(s: str) -> bool:
-    t = (s or "").lower().strip()
-    return bool(_YES_PAT.search(t)) or t.startswith(("si","sí","ok"))
+    t = (s or "").strip().lower()
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
+    return bool(_YES_PAT.search(t))
+
 def is_no(s: str) -> bool:
-    t = (s or "").lower().strip()
-    return bool(_NO_PAT.search(t)) or t.startswith("no")
+    t = (s or "").strip().lower()
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
+    return bool(_NO_PAT.search(t))
 
 def parse_time_hint(text: str):
     """
-    Extrae hora explícita (10:30, 4 pm, 16:00). Devuelve (hour, minute) o None.
+    Extrae hora explícita de expresiones comunes:
+      - "20:00", "20.00", "20 00"
+      - "8 pm", "8pm", "8:00pm", "8.00 pm"
+      - "20 h", "20 hrs", "20 horas"
+      - "ocho de la noche/tarde/mañana/madrugada"
+      - "mediodía", "medianoche"
+    Devuelve (hour, minute) o None.
     """
-    t = (text or "").lower().strip()
-    # hh:mm (acepta "4:00 pm")
-    m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\s*(am|pm)?\b", t)
+    t = (text or "").strip().lower()
+    # normaliza diacríticos y espacios raros
+    t_norm = unicodedata.normalize("NFD", t)
+    t_norm = "".join(ch for ch in t_norm if unicodedata.category(ch) != "Mn")
+    t_norm = re.sub(r"\s+", " ", t_norm)
+
+    # atajos especiales
+    if re.search(r"\bmediodia\b", t_norm):
+        return 12, 0
+    if re.search(r"\bmedianoche\b", t_norm):
+        return 0, 0
+
+    # 1) hh:mm (opcional am/pm) — permite ":" "." o espacio como separador
+    m = re.search(r"\b([01]?\d|2[0-3])\s*[:\. ]\s*([0-5]\d)\s*(am|pm)?\b", t_norm)
     if m:
         h = int(m.group(1)); mnt = int(m.group(2)); ampm = (m.group(3) or "").lower()
         if ampm == "pm" and h != 12: h += 12
         if ampm == "am" and h == 12: h = 0
         return h, mnt
-    # h am/pm
-    m = re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t)
+
+    # 2) h am/pm (sin minutos)
+    m = re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t_norm)
     if m:
         h = int(m.group(1)); ampm = m.group(2)
         if ampm == "pm" and h != 12: h += 12
         if ampm == "am" and h == 12: h = 0
         return h, 0
-    # hh (24h)
-    m = re.search(r"\b(0?\d|1\d|2[0-3])\s*h?\b", t)
+
+    # 3) h[.:]mm con am/pm pegado (ej. 8:00pm, 8.00pm)
+    m = re.search(r"\b([1-9]|1[0-2])\s*[:\.]\s*([0-5]\d)\s*(?:pm|am)\b", t_norm)
+    if m:
+        h = int(m.group(1)); mnt = int(m.group(2))
+        ampm = "pm" if "pm" in t_norm[m.end()-2:m.end()] else "am"
+        if ampm == "pm" and h != 12: h += 12
+        if ampm == "am" and h == 12: h = 0
+        return h, mnt
+
+    # 4) solo hora 0-23 con sufijos (h/hrs/horas)
+    m = re.search(r"\b(0?\d|1\d|2[0-3])\s*(?:h|hrs|horas?)\b", t_norm)
     if m:
         return int(m.group(1)), 0
+
+    # 5) solo hora 0-23 "limpia" (ej. "a las 20", "20")
+    m = re.search(r"\b(?:a las\s+)?(0?\d|1\d|2[0-3])\b", t_norm)
+    if m:
+        return int(m.group(1)), 0
+
+    # 6) hora en palabras + momento del día (ocho de la tarde/noche/mañana/madrugada)
+    palabras = {
+        "una":1, "uno":1,
+        "dos":2, "tres":3, "cuatro":4, "cinco":5, "seis":6,
+        "siete":7, "ocho":8, "nueve":9, "diez":10, "once":11, "doce":12
+    }
+    m = re.search(r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?", t_norm)
+    if m:
+        h = palabras[m.group(1)]
+        franja = m.group(2) or ""
+        # interpreta franja
+        if franja == "manana":
+            if h == 12: h = 0
+        elif franja in ("tarde", "noche"):
+            if h != 12: h += 12
+        elif franja == "madrugada":
+            if h == 12: h = 0  # 12 de la madrugada -> 00:00
+            # 1-5 se quedan tal cual (01-05)
+        # sin franja: dejamos 1-12 tal cual (ambigua, pero el FSM luego valida contra disponibilidad)
+        return h, 0
+
+    # 7) “y media” / “y cuarto” / “menos cuarto” (opcionales) — versión simple
+    #    Si el usuario pone “ocho y media (de la tarde)”
+    m = re.search(
+        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+y\s+(media|cuarto)\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?",
+        t_norm
+    )
+    if m:
+        h = palabras[m.group(1)]
+        parte = m.group(2)
+        franja = m.group(3) or ""
+        minutes = 30 if parte == "media" else 15
+        if franja == "manana":
+            if h == 12: h = 0
+        elif franja in ("tarde", "noche"):
+            if h != 12: h += 12
+        elif franja == "madrugada":
+            if h == 12: h = 0
+        return h, minutes
+
+    m = re.search(
+        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+menos\s+cuarto\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?",
+        t_norm
+    )
+    if m:
+        h = palabras[m.group(1)]
+        franja = m.group(2) or ""
+        # menos cuarto => xx:45 de la hora anterior
+        h = (h - 1) if h > 1 else 12
+        if franja == "manana":
+            if h == 12: h = 0
+        elif franja in ("tarde", "noche"):
+            if h != 12: h += 12
+        elif franja == "madrugada":
+            if h == 12: h = 0
+        return h, 45
+
     return None
 
 def human_slot_strings(slots, limit=12, balanced=True):
@@ -339,32 +440,58 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
     if state == "await_time":
         time_hint = parse_time_hint(raw_text)
         if not time_hint:
-            # tono+
-            send_text(From, polish("Gracias. Para continuar, indíqueme por favor la hora que prefiere (por ejemplo, 16:00)."))
+            send_text(
+                From,
+                polish(
+                    "Gracias. Para continuar, ¿me indica la hora que prefiere? "
+                    "Puede escribirla como 16:00, 4 pm u “ocho de la tarde”."
+                ),
+            )
             return ""
+
         target_h, target_m = time_hint
         parsed_date = ctx.get("last_date")
         if not parsed_date:
             send_text(From, polish(generate_reply("ask_date_strict", {})))
             _set_state(From, "await_date")
             return ""
+
         for db in db_session():
             slots = available_slots(db, parsed_date, settings.TIMEZONE)
             if not slots:
-                send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(parsed_date, datetime.min.time())})))
+                send_text(
+                    From,
+                    polish(
+                        generate_reply(
+                            "day_full",
+                            {"date_dt": datetime.combine(parsed_date, datetime.min.time())},
+                        )
+                    ),
+                )
                 _set_state(From, "await_date")
                 break
+
             match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
             if match:
-                # Pedimos confirmación (no calendar aún)
-                send_text(From, polish(generate_reply("confirm_q", {"appt_dt": match})))
+                # Pedimos confirmación (no calendar aún) con fallback si falta la plantilla
+                try:
+                    send_text(From, polish(generate_reply("confirm_q", {"appt_dt": match})))
+                except Exception:
+                    when = f"{match.strftime('%d/%m/%Y')} a las {match.strftime('%H:%M')}"
+                    send_text(From, polish(f"Para confirmar, sería el {when}. ¿Es correcto?"))
+
                 _set_state(From, "await_confirm", last_date=parsed_date, last_time=(target_h, target_m))
             else:
                 alts = human_slot_strings(slots, limit=12, balanced=False)
-                send_text(From, polish(generate_reply(
-                    "time_unavailable",
-                    {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts}
-                )))
+                send_text(
+                    From,
+                    polish(
+                        generate_reply(
+                            "time_unavailable",
+                            {"date_dt": datetime.combine(parsed_date, datetime.min.time()), "slots_list": alts},
+                        )
+                    ),
+                )
         return ""
 
     # --------- AWAIT_DATE: esperar fecha ---------
