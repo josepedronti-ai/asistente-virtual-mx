@@ -1,16 +1,22 @@
+# app/main.py
 from fastapi import FastAPI
 from .config import settings
 from .database import init_db
-from .routers import appointments, waitlist, webhooks
 from .jobs.scheduler import start_scheduler
-from .routers import webhooks, admin
+
+# importa routers con nombres explícitos
+from .routers.appointments import router as appointments_router
+from .routers.waitlist import router as waitlist_router
+from .routers.webhooks import router as webhooks_router
+from .routers.admin import router as admin_router
 
 app = FastAPI(title=settings.APP_NAME)
 
-app.include_router(appointments.router)
-app.include_router(waitlist.router)
-app.include_router(webhooks.router)
-app.include_router(admin.router)
+# monta rutas
+app.include_router(appointments_router)
+app.include_router(waitlist_router)
+app.include_router(webhooks_router)
+app.include_router(admin_router, prefix="/admin")  # <— importante
 
 @app.on_event("startup")
 def on_startup():
