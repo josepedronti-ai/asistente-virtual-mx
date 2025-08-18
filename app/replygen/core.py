@@ -39,11 +39,18 @@ def _greet(state: Dict[str, Any]) -> str:
     saludo = _time_greeting(state.get("now"))
     return f"Hola, {saludo}. Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?"
 
-# 2) Pedir fecha (estricto, para reducir errores)
+# 2) Pedir fecha (suave, primera vez)
+def _ask_date_soft(state: Dict[str, Any]) -> str:
+    return (
+        "Con gusto le ayudo a agendar. ¿Qué fecha le viene bien? "
+        "Puede escribirme, por ejemplo: “18/08”, “18 de agosto”, “mañana” o “próximo lunes”."
+    )
+
+# 2b) Pedir fecha (estricto, si no entendimos)
 def _ask_date_strict(state: Dict[str, Any]) -> str:
     return (
-        "Claro, para agendar su cita necesito la fecha exacta (formato Día/Mes/Año) para evitar confusiones. "
-        "¿Qué día le gustaría?"
+        "Para evitar confusiones, ¿me indica la fecha exacta en formato Día/Mes/Año? "
+        "Por ejemplo: 18/08/2025. (También entiendo “mañana” o “próximo lunes”)."
     )
 
 # 3) Listar horarios de una fecha
@@ -160,6 +167,7 @@ def _fallback(state: Dict[str, Any]) -> str:
 # ==========================
 _HANDLERS = {
     "greet": _greet,
+    "ask_date_soft": _ask_date_soft,
     "ask_date_strict": _ask_date_strict,
     "list_slots_for_date": _list_slots_for_date,
     "confirm_q": _confirm_q,             # <-- NUEVA

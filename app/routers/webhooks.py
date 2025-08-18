@@ -22,6 +22,7 @@ from ..services.nlu import analizar
 from ..replygen.core import generate_reply
 from ..replygen.llm import polish_spanish_mx as polish  # pulido humano si hay OPENAI_API_KEY
 
+
 # =========================
 # Memoria corta (contexto)
 # =========================
@@ -37,7 +38,7 @@ def _set_state(contact: str, state: str, **kv):
     ctx["state"] = state
     ctx["ts"] = _now_utc()
     SESSION_CTX[contact] = ctx
-    print(f"[STATE] {contact} -> {state} | { {k:v for k,v in kv.items() if k!='ts'} }")
+    print(f"[STATE] {contact} -> {state} | {{k: v for k, v in {kv}.items() if k!='ts'}}")
 
 def _get_ctx(contact: str):
     ctx = SESSION_CTX.get(contact)
@@ -55,6 +56,7 @@ def _clear_ctx(contact: str, *keys):
     ctx["ts"] = _now_utc()
     SESSION_CTX[contact] = ctx
 
+
 # ----------------------------
 # Utilidades de texto y hora
 # ----------------------------
@@ -71,7 +73,7 @@ def _clean_person_name(raw: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s.title()
 
-# Sí / No humanos
+# Sí / No humanos (más tolerantes)
 _YES_PAT = re.compile(
     r"(?:^|\b)(?:s[ií]|sí por favor|si por favor|claro(?: que s[ií])?|correcto|ok(?:ay)?|vale|de acuerdo|afirmativo|me parece|está bien|esta bien|perfecto|va|sale|adelante|funciona|me late|confirmo|confirmar|agendar|queda|listo)(?:\b|$)"
 )
@@ -91,6 +93,7 @@ def is_no(s: str) -> bool:
     t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
     return bool(_NO_PAT.search(t))
 
+
 def parse_time_hint(text: str):
     """
     Extrae hora explícita de expresiones comunes:
@@ -102,7 +105,6 @@ def parse_time_hint(text: str):
     Devuelve (hour, minute) o None.
     """
     t = (text or "").strip().lower()
-    # normaliza diacríticos y espacios raros
     t_norm = unicodedata.normalize("NFD", t)
     t_norm = "".join(ch for ch in t_norm if unicodedata.category(ch) != "Mn")
     t_norm = re.sub(r"\s+", " ", t_norm)
@@ -113,7 +115,7 @@ def parse_time_hint(text: str):
     if re.search(r"\bmedianoche\b", t_norm):
         return 0, 0
 
-    # 1) hh:mm (opcional am/pm) — permite ":" "." o espacio como separador
+    # 1) hh:mm (opcional am/pm) — ":" "." o espacio como separador
     m = re.search(r"\b([01]?\d|2[0-3])\s*[:\. ]\s*([0-5]\d)\s*(am|pm)?\b", t_norm)
     if m:
         h = int(m.group(1)); mnt = int(m.group(2)); ampm = (m.group(3) or "").lower()
@@ -121,7 +123,7 @@ def parse_time_hint(text: str):
         if ampm == "am" and h == 12: h = 0
         return h, mnt
 
-    # 2) h am/pm (sin minutos)
+    # 2) h am/pm
     m = re.search(r"\b([1-9]|1[0-2])\s*(am|pm)\b", t_norm)
     if m:
         h = int(m.group(1)); ampm = m.group(2)
@@ -129,7 +131,7 @@ def parse_time_hint(text: str):
         if ampm == "am" and h == 12: h = 0
         return h, 0
 
-    # 3) h[.:]mm con am/pm pegado (ej. 8:00pm, 8.00pm)
+    # 3) h[:.]mm con am/pm pegado (8:00pm, 8.00pm)
     m = re.search(r"\b([1-9]|1[0-2])\s*[:\.]\s*([0-5]\d)\s*(?:pm|am)\b", t_norm)
     if m:
         h = int(m.group(1)); mnt = int(m.group(2))
@@ -138,41 +140,38 @@ def parse_time_hint(text: str):
         if ampm == "am" and h == 12: h = 0
         return h, mnt
 
-    # 4) solo hora 0-23 con sufijos (h/hrs/horas)
-    m = re.search(r"\b(0?\d|1\d|2[0-3])\s*(?:h|hrs|horas?)\b", t_norm)
+    # 4) “8 de la tarde/noche/mañana/madrugada”
+    m = re.search(r"\b([1-9]|1[0-2])\s*(?:de\s+la\s+)?(manana|mañana|tarde|noche|madrugada)\b", t_norm)
     if m:
-        return int(m.group(1)), 0
+        h = int(m.group(1)); per = m.group(2)
+        if per in ("manana","mañana"):
+            if h == 12: h = 0
+        elif per in ("tarde", "noche"):
+            if h != 12: h += 12
+        elif per == "madrugada":
+            if h == 12: h = 0
+        return h, 0
 
-    # 5) solo hora 0-23 "limpia" (ej. "a las 20", "20")
-    m = re.search(r"\b(?:a las\s+)?(0?\d|1\d|2[0-3])\b", t_norm)
-    if m:
-        return int(m.group(1)), 0
-
-    # 6) hora en palabras + momento del día (ocho de la tarde/noche/mañana/madrugada)
+    # 5) palabras (uno..doce) + franja
     palabras = {
-        "una":1, "uno":1,
-        "dos":2, "tres":3, "cuatro":4, "cinco":5, "seis":6,
+        "una":1, "uno":1, "dos":2, "tres":3, "cuatro":4, "cinco":5, "seis":6,
         "siete":7, "ocho":8, "nueve":9, "diez":10, "once":11, "doce":12
     }
-    m = re.search(r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?", t_norm)
-    if m:
-        h = palabras[m.group(1)]
-        franja = m.group(2) or ""
-        # interpreta franja
-        if franja == "manana":
+    w = re.search(r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b(?:.*?\bde la\b\s+(manana|mañana|tarde|noche|madrugada))?", t_norm)
+    if w:
+        h = palabras[w.group(1)]
+        franja = w.group(2) or ""
+        if franja in ("manana","mañana"):
             if h == 12: h = 0
         elif franja in ("tarde", "noche"):
             if h != 12: h += 12
         elif franja == "madrugada":
-            if h == 12: h = 0  # 12 de la madrugada -> 00:00
-            # 1-5 se quedan tal cual (01-05)
-        # sin franja: dejamos 1-12 tal cual (ambigua, pero el FSM luego valida contra disponibilidad)
+            if h == 12: h = 0
         return h, 0
 
-    # 7) “y media” / “y cuarto” / “menos cuarto” (opcionales) — versión simple
-    #    Si el usuario pone “ocho y media (de la tarde)”
+    # 6) “y media / y cuarto / menos cuarto”
     m = re.search(
-        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+y\s+(media|cuarto)\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?",
+        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+y\s+(media|cuarto)\b(?:.*?\bde la\b\s+(manana|mañana|tarde|noche|madrugada))?",
         t_norm
     )
     if m:
@@ -180,7 +179,7 @@ def parse_time_hint(text: str):
         parte = m.group(2)
         franja = m.group(3) or ""
         minutes = 30 if parte == "media" else 15
-        if franja == "manana":
+        if franja in ("manana","mañana"):
             if h == 12: h = 0
         elif franja in ("tarde", "noche"):
             if h != 12: h += 12
@@ -189,15 +188,14 @@ def parse_time_hint(text: str):
         return h, minutes
 
     m = re.search(
-        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+menos\s+cuarto\b(?:.*?\bde la\b\s+(manana|tarde|noche|madrugada))?",
+        r"\b(una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+menos\s+cuarto\b(?:.*?\bde la\b\s+(manana|mañana|tarde|noche|madrugada))?",
         t_norm
     )
     if m:
         h = palabras[m.group(1)]
         franja = m.group(2) or ""
-        # menos cuarto => xx:45 de la hora anterior
         h = (h - 1) if h > 1 else 12
-        if franja == "manana":
+        if franja in ("manana","mañana"):
             if h == 12: h = 0
         elif franja in ("tarde", "noche"):
             if h != 12: h += 12
@@ -205,7 +203,18 @@ def parse_time_hint(text: str):
             if h == 12: h = 0
         return h, 45
 
+    # 7) “20 h / 20 hrs / 20 horas”
+    m = re.search(r"\b(0?\d|1\d|2[0-3])\s*(?:h|hrs|horas?)\b", t_norm)
+    if m:
+        return int(m.group(1)), 0
+
+    # 8) solo “20”
+    m = re.search(r"\b(0?\d|1\d|2[0-3])\b", t_norm)
+    if m:
+        return int(m.group(1)), 0
+
     return None
+
 
 def human_slot_strings(slots, limit=12, balanced=True):
     """
@@ -220,14 +229,21 @@ def human_slot_strings(slots, limit=12, balanced=True):
         selected = [slots[i] for i in range(0, len(slots), step)][:limit]
     return [s.strftime("%H:%M") for s in selected]
 
-# --- Fechas: parser natural con fallback a extractor propio ---
-def extract_spanish_date(text: str, today: date) -> date | None:
+
+# --- Fechas: parser natural (robusto) ---
+def parse_natural_date(text: str, today: date) -> date | None:
+    """
+    Entiende “mañana”, “pasado mañana”, “este martes”, “próximo lunes”,
+    “18 de agosto”, “18/8[/2025]”, etc. Prefiere fechas futuras.
+    """
     if not text:
         return None
-    t_raw = (text or "").strip().lower()
-    t = unicodedata.normalize("NFD", t_raw)
+
+    raw = (text or "").strip().lower()
+    t = unicodedata.normalize("NFD", raw)
     t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
 
+    # Atajos rápidos
     if "pasado manana" in t:
         return today + timedelta(days=2)
     if "manana" in t:
@@ -235,49 +251,60 @@ def extract_spanish_date(text: str, today: date) -> date | None:
     if "hoy" in t:
         return today
 
-    _WEEK_MAP = {
-        "lunes": 0, "martes": 1, "miercoles": 2,
-        "jueves": 3, "viernes": 4, "sabado": 5, "domingo": 6
-    }
-    for w, idx in _WEEK_MAP.items():
-        if re.search(rf"\b{w}\b", t):
-            delta = (idx - today.weekday()) % 7
+    # Semana: “este/próximo/siguiente + día”
+    week_days = {"lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4,"sabado":5,"sábado":5,"domingo":6}
+    m = re.search(r"\b(este|proximo|pr[oó]ximo|siguiente)?\s*(lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b", t)
+    if m:
+        qual = (m.group(1) or "").replace("ó","o")
+        wd = m.group(2)
+        idx = week_days["miercoles"] if wd in ("miercoles","miércoles") else week_days["sabado"] if wd in ("sabado","sábado") else week_days[wd]
+        delta = (idx - today.weekday()) % 7
+        if qual in ("proximo","proximo","siguiente"):
             if delta == 0:
                 delta = 7
-            return today + timedelta(days=delta)
+        else:
+            # “este” → esta semana (si ya pasó la jornada, puedes ajustar según reglas propias)
+            if delta == 0:
+                delta = 0
+        return today + timedelta(days=delta)
 
-    m = re.search(r"\b([0-3]?\d)[/\-\.]([01]?\d)[/\-\.](\d{4})\b", t)
+    # dd/mm(/yyyy) o dd-mm(/yyyy) o dd.mm(/yyyy)
+    m = re.search(r"\b([0-3]?\d)[/\-\.]([01]?\d)(?:[\/\-\.](\d{2,4}))?\b", t)
     if m:
-        d_, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        d_, mth = int(m.group(1)), int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else today.year
+        if y < 100:
+            y += 2000
         try:
-            return date(y, mth, d_)
+            candidate = date(y, mth, d_)
+            if candidate < today and not m.group(3):
+                candidate = date(y+1, mth, d_)
+            return candidate
         except ValueError:
             return None
 
+    # “dd de mes [yyyy]” / “dd mes [yyyy]”
     meses = {
-        "enero":1, "febrero":2, "marzo":3, "abril":4, "mayo":5, "junio":6,
-        "julio":7, "agosto":8, "septiembre":9, "setiembre":9,
-        "octubre":10, "noviembre":11, "diciembre":12
+        "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+        "julio":7,"agosto":8,"septiembre":9,"setiembre":9,
+        "octubre":10,"noviembre":11,"diciembre":12
     }
-    m2 = re.search(r"\b([0-3]?\d)\s*(?:de\s+)?([a-z]+)\s*(?:de\s+)?(\d{4})\b", t)
-    if m2:
-        d__ = int(m2.group(1)); mes_txt = m2.group(2); y = int(m2.group(3))
-        if mes_txt in meses:
-            try:
-                return date(y, meses[mes_txt], d__)
-            except ValueError:
-                return None
+    m = re.search(r"\b([0-3]?\d)\s*(?:de\s+)?([a-z]+)(?:\s+de)?\s*(\d{4})?\b", t)
+    if m and m.group(2) in meses:
+        d_ = int(m.group(1)); mth = meses[m.group(2)]
+        y = int(m.group(3)) if m.group(3) else today.year
+        try:
+            candidate = date(y, mth, d_)
+            if candidate < today and not m.group(3):
+                candidate = date(y+1, mth, d_)
+            return candidate
+        except ValueError:
+            return None
 
-    try:
-        dt = dtparser.parse(t_raw, dayfirst=True, fuzzy=True)
-        return dt.date()
-    except Exception:
-        return None
-
-def parse_natural_date(text: str, today: date) -> date | None:
+    # Último intento con dateparser (favor futuro)
     try:
         dt = dp_parse(
-            text or "",
+            raw,
             languages=["es"],
             settings={
                 "PREFER_DATES_FROM": "future",
@@ -286,10 +313,15 @@ def parse_natural_date(text: str, today: date) -> date | None:
             },
         )
         if dt:
-            return dt.date()
+            d = dt.date()
+            if d < today:
+                return None
+            return d
     except Exception:
         pass
-    return extract_spanish_date(text, today)
+
+    return None
+
 
 # ----------------------------
 # DB helpers
@@ -353,7 +385,9 @@ def move_or_create_appointment(db: Session, patient: models.Patient, start_dt: d
     db.refresh(appt)
     return appt
 
+
 router = APIRouter(prefix="", tags=["webhooks"])
+
 
 # ----------------------------
 # Webhook principal (FSM primero, NLU después)
@@ -381,6 +415,24 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
 
     # --------- AWAIT_NAME: guardar nombre y AGENDAR en Calendar ---------
     if state == "await_name":
+        # Si el usuario cambia de fecha aquí, reencaminar
+        today = datetime.now().date()
+        new_date = parse_natural_date(raw_text, today)
+        if new_date and (new_date != ctx.get("last_date")):
+            for db in db_session():
+                slots = available_slots(db, new_date, settings.TIMEZONE)
+                if not slots:
+                    send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(new_date, datetime.min.time())})))
+                    _set_state(From, "await_date")
+                    break
+                alts = human_slot_strings(slots, limit=12, balanced=True)
+                send_text(From, polish(generate_reply(
+                    "list_slots_for_date",
+                    {"date_dt": datetime.combine(new_date, datetime.min.time()), "slots_list": alts}
+                )))
+            _set_state(From, "await_time", last_date=new_date)
+            return ""
+
         cleaned = _clean_person_name(raw_text)
         if len(cleaned) < 3:
             send_text(From, polish(generate_reply("need_name", {})))
@@ -418,8 +470,25 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
 
     # --------- AWAIT_CONFIRM: sí/no de confirmación ---------
     if state == "await_confirm":
+        # ¿El usuario cambió la fecha aquí? → relistar y regresar a await_time
+        today = datetime.now().date()
+        new_date = parse_natural_date(raw_text, today)
+        if new_date and (new_date != ctx.get("last_date")):
+            for db in db_session():
+                slots = available_slots(db, new_date, settings.TIMEZONE)
+                if not slots:
+                    send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(new_date, datetime.min.time())})))
+                    _set_state(From, "await_date")
+                    break
+                alts = human_slot_strings(slots, limit=12, balanced=True)
+                send_text(From, polish(generate_reply(
+                    "list_slots_for_date",
+                    {"date_dt": datetime.combine(new_date, datetime.min.time()), "slots_list": alts}
+                )))
+            _set_state(From, "await_time", last_date=new_date)
+            return ""
+
         if is_yes(raw_text) or text in ("agendar","agendar cita","confirmar","confirmo","ok"):
-            # Confirmó → ahora pedimos nombre
             send_text(From, polish(generate_reply("need_name", {})))
             _set_state(From, "await_name")
             return ""
@@ -438,6 +507,25 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
 
     # --------- AWAIT_TIME: esperar hora ---------
     if state == "await_time":
+        # ¿El usuario cambió la fecha aquí en lugar de dar hora?
+        today = datetime.now().date()
+        new_date = parse_natural_date(raw_text, today)
+        if new_date and (new_date != ctx.get("last_date")):
+            for db in db_session():
+                slots = available_slots(db, new_date, settings.TIMEZONE)
+                if not slots:
+                    send_text(From, polish(generate_reply("day_full", {"date_dt": datetime.combine(new_date, datetime.min.time())})))
+                    _set_state(From, "await_date")
+                    break
+                alts = human_slot_strings(slots, limit=12, balanced=True)
+                send_text(From, polish(generate_reply(
+                    "list_slots_for_date",
+                    {"date_dt": datetime.combine(new_date, datetime.min.time()), "slots_list": alts}
+                )))
+            _set_state(From, "await_time", last_date=new_date)
+            return ""
+
+        # Si no cambió fecha, esperamos hora
         time_hint = parse_time_hint(raw_text)
         if not time_hint:
             send_text(
@@ -473,13 +561,11 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
 
             match = next((s for s in slots if s.hour == target_h and s.minute == target_m), None)
             if match:
-                # Pedimos confirmación (no calendar aún) con fallback si falta la plantilla
                 try:
                     send_text(From, polish(generate_reply("confirm_q", {"appt_dt": match})))
                 except Exception:
                     when = f"{match.strftime('%d/%m/%Y')} a las {match.strftime('%H:%M')}"
                     send_text(From, polish(f"Para confirmar, sería el {when}. ¿Es correcto?"))
-
                 _set_state(From, "await_confirm", last_date=parsed_date, last_time=(target_h, target_m))
             else:
                 alts = human_slot_strings(slots, limit=12, balanced=False)
@@ -499,8 +585,7 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
         today = datetime.now().date()
         parsed_date = parse_natural_date(raw_text, today)
         if not parsed_date:
-            # tono+
-            send_text(From, polish("Gracias. Para continuar, compártame la fecha en formato Día/Mes/Año (ej. 18/08/2025)."))
+            send_text(From, polish(generate_reply("ask_date_strict", {})))  # se queda igual
             return ""
         for db in db_session():
             slots = available_slots(db, parsed_date, settings.TIMEZONE)
@@ -582,9 +667,9 @@ async def whatsapp_webhook(From: str = Form(None), Body: str = Form(None)) -> st
         _set_state(From, "idle")
         return ""
 
-    # Book / Reschedule (en idle) → pedir fecha estricta
+    # Book / Reschedule (en idle) → pedir fecha (suave la primera vez)
     if intent in ("book","reschedule") and state == "idle":
-        send_text(From, polish(generate_reply("ask_date_strict", {})))
+        send_text(From, polish(generate_reply("ask_date_soft", {})))
         _set_state(From, "await_date")
         return ""
 
