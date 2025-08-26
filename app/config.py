@@ -64,11 +64,19 @@ class Settings(BaseSettings):
     # ===== Admin =====
     ADMIN_TOKEN: Optional[str] = None
 
+    # ===== AI Agent (OpenAI) =====
+    # Si no pones OPENAI_API_KEY, se desactiva USE_AGENT automáticamente en model_post_init
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_AGENT_MODEL: str = "gpt-4o-mini"
+    USE_AGENT: bool = True
+    AGENT_MAX_TOOL_HOPS: int = 6  # cuántas llamadas a herramientas puede encadenar el agente
+
     def model_post_init(self, __context) -> None:
         """
         Backfill de:
           - GOOGLE_* → GCAL_*
           - START/END ↔ OPEN/CLOSE (ambos nombres quedan válidos)
+          - USE_AGENT False si falta OPENAI_API_KEY
         """
         # Calendar ID
         if (not self.GCAL_CALENDAR_ID or self.GCAL_CALENDAR_ID == "primary") and self.GOOGLE_CALENDAR_ID:
@@ -90,6 +98,10 @@ class Settings(BaseSettings):
             # si OPEN/CLOSE no fue seteado explícitamente pero START/END sí
             self.CLINIC_OPEN_HOUR = self.CLINIC_START_HOUR
             self.CLINIC_CLOSE_HOUR = self.CLINIC_END_HOUR
+
+        # Si no hay API key, apaga el agente para evitar errores en runtime
+        if not (self.OPENAI_API_KEY or "").strip():
+            self.USE_AGENT = False
 
 
 settings = Settings()

@@ -4,7 +4,7 @@ from .config import settings
 from .database import init_db
 from .jobs.scheduler import start_scheduler
 
-# importa routers con nombres explícitos
+# Routers
 from .routers.appointments import router as appointments_router
 from .routers.waitlist import router as waitlist_router
 from .routers.webhooks import router as webhooks_router
@@ -12,7 +12,7 @@ from .routers.admin import router as admin_router
 
 app = FastAPI(title=settings.APP_NAME)
 
-# monta rutas
+# Monta rutas
 app.include_router(appointments_router)
 app.include_router(waitlist_router)
 app.include_router(webhooks_router)
