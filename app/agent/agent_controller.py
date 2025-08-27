@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, json, re, unicodedata, uuid
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 from openai import OpenAI
 
@@ -25,6 +26,10 @@ TTL_MIN = 20
 def _now():
     return datetime.utcnow()
 
+def _now_local() -> datetime:
+    tz = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
+    return datetime.now(ZoneInfo(tz))
+
 def _get_mem(contact: str):
     ctx = _AGENT_SESSIONS.get(contact)
     if not ctx:
@@ -34,8 +39,12 @@ def _get_mem(contact: str):
         return None
     return ctx
 
-def _save_mem(contact: str, messages: list[dict]):
-    _AGENT_SESSIONS[contact] = {"ts": _now(), "messages": messages[-50:]}
+def _save_mem(contact: str, messages: list[dict], greeted: bool | None = None):
+    prev = _AGENT_SESSIONS.get(contact) or {}
+    state = {"ts": _now(), "messages": messages[-50:], "greeted": prev.get("greeted", False)}
+    if greeted is not None:
+        state["greeted"] = bool(greeted)
+    _AGENT_SESSIONS[contact] = state
 
 # -----------------------
 # DB helpers (copiados para evitar dependencias circulares)
@@ -288,13 +297,15 @@ SYSTEM_PROMPT = (
 
     TONO Y ESTILO
     - Español de México, trato de “usted”.
-    - Cálido, claro y profesional; humano, nunca robótico; nada intrusivo.
+    - Humano, amable, formal y profesional; claro y sin tecnicismos innecesarios; nada intrusivo.
     - Frases breves y bien estructuradas.
-    - Presentación inicial (primer mensaje con un contacto o si el usuario saluda sin contexto):
-      “Hola, soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle?”
-    - Emojis permitidos solo para dar claridad visual en citas:
+    - Presentación inicial (solo si es el primer mensaje del contacto o si el usuario saluda sin contexto, y sin haberla dado antes):
+      “Hola, buenas (días/tardes/noches). Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?”
+      • Escoge “días/tardes/noches” según la hora local de Monterrey (America/Monterrey).
+      • Si el usuario ya expresa una intención clara (agendar/reagendar/cancelar/precios/ubicación), responde directo sin repetir la presentación.
+    - Emojis permitidos únicamente para claridad visual en citas:
       📅 (fecha) y ⏰ (hora). Evita cualquier otro emoji y separadores raros (no uses “|”).
-    
+
     REGLAS CRÍTICAS
     1) Jamás inventes disponibilidad: usa siempre herramientas para consultar horarios.
     2) Normalización de fechas:
@@ -311,7 +322,7 @@ SYSTEM_PROMPT = (
        - Si el servidor indica `slot_unavailable`, ofrece 4–8 alternativas del mismo día.
     6) Reprogramación/cancelación:
        - Antes de mover o cancelar, verifica que exista cita activa (usa herramientas). Si no hay, explícalo con cortesía.
-    7) Mensajes concisos; sin tecnicismos innecesarios; sin insistir si el paciente no responde.
+    7) Mensajes concisos; sin insistir si el paciente no responde.
     8) Mantén idempotencia: cuando reserves o muevas, pasa un `client_request_id` único.
 
     FORMATO DE RESPUESTA
@@ -418,7 +429,7 @@ def _dispatch_tool(contact: str, name: str, args: dict):
     return {"error": f"unknown_tool:{name}"}
 
 # -----------------------
-# UX Hook: forzar parse_date si el mensaje es relativo/ambiguo
+# UX Hooks
 # -----------------------
 def _force_parse_date_if_needed(user_text: str, today_iso: str) -> dict | None:
     """
@@ -426,7 +437,6 @@ def _force_parse_date_if_needed(user_text: str, today_iso: str) -> dict | None:
     para que la normalización de la fecha sea 100% del lado servidor.
     """
     t = _norm(user_text)
-    # claves típicas de relativa/ambigua
     claves = [
         "hoy", "mañana", "manana", "pasado mañana", "pasado manana",
         "próximo", "proximo", "esta semana", "la siguiente semana",
@@ -448,6 +458,38 @@ def _force_parse_date_if_needed(user_text: str, today_iso: str) -> dict | None:
             "content": ""
         }
     return None
+
+_GREETING_WORDS = (
+    "hola", "buenos dias", "buenos días", "buenas", "buenas tardes",
+    "buenas noches", "qué tal", "que tal", "saludos"
+)
+
+_INTENT_HINTS = (
+    "cita", "agendar", "agendarme", "reagendar", "cambiar", "mover", "cancelar",
+    "precio", "costos", "costo", "tarifa", "ubicacion", "ubicación", "direccion",
+    "dirección", "como llegar", "cómo llegar", "horario", "disponibilidad",
+    "mañana", "manana", "hoy", "pasado", "lunes", "martes", "miercoles", "miércoles",
+    "jueves", "viernes", "sabado", "sábado", "domingo"
+)
+
+def _is_pure_greeting(user_text: str) -> bool:
+    t = _norm(user_text)
+    has_greeting = any(g in t for g in _GREETING_WORDS)
+    has_intent = any(k in t for k in _INTENT_HINTS)
+    return has_greeting and not has_intent and len(t) <= 40  # mensajes cortos tipo “hola”, “buenas noches”
+
+def _daypart_label(hour: int) -> str:
+    # días 06–11, tardes 12–18, noches 19–05
+    if 6 <= hour < 12:
+        return "días"
+    if 12 <= hour < 19:
+        return "tardes"
+    return "noches"
+
+def _build_greeting() -> str:
+    h = _now_local().hour
+    tramo = _daypart_label(h)
+    return f"Hola, buenas {tramo}. Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?"
 
 # -----------------------
 # Loop del Agente
@@ -474,12 +516,26 @@ def run_agent(contact: str, user_text: str) -> str:
     # Instanciar cliente SIN kwargs (evita errores de 'proxies' u otros)
     client = OpenAI()
 
-    mem = _get_mem(contact) or {"messages": []}
-    messages = mem["messages"]
+    mem = _get_mem(contact) or {"messages": [], "greeted": False}
+    messages = mem.get("messages", [])
+    greeted = bool(mem.get("greeted", False))
 
+    # 🔹 Interceptor de saludo "puro" para presentación única
+    if not greeted and _is_pure_greeting(user_text):
+        greeting_text = _build_greeting()
+        # Registramos conversación mínima para contexto futuro
+        if not any(m.get("role") == "system" for m in messages):
+            messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "assistant", "content": greeting_text})
+        _save_mem(contact, messages, greeted=True)
+        return greeting_text
+
+    # Inyectar prompt del sistema si hace falta
     if not any(m.get("role") == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
+    # Nuevo mensaje del usuario
     messages.append({"role": "user", "content": user_text})
 
     # 🔹 Hook: forzar parse_date si detectamos “hoy/mañana/próximo…”
@@ -542,8 +598,11 @@ def run_agent(contact: str, user_text: str) -> str:
         final_text = (msg.content or "").strip()
         if not final_text:
             final_text = "Por ahora no pude completar la acción. ¿Desea que intentemos nuevamente o prefiere hablar con recepción?"
-        _save_mem(contact, messages)
+
+        # Guardamos para no repetir presentación en futuros saludos
+        messages.append({"role": "assistant", "content": final_text})
+        _save_mem(contact, messages, greeted=True)  # una vez que respondió, ya consideramos que se presentó/avanzó
         return final_text
 
-    _save_mem(contact, messages)
+    _save_mem(contact, messages, greeted=True)
     return "Tuve un problema para cerrar la operación. ¿Desea que lo intente de nuevo o prefiere hablar con recepción?"
