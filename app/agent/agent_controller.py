@@ -192,77 +192,109 @@ def tool_check_slots(contact: str, date_iso: str):
         return {"date_iso": date_iso, "slots": [s.strftime("%H:%M") for s in slots]}
 
 def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_name: str, channel: str, client_request_id: str):
+    # Validación básica
     if not (patient_name and patient_name.strip() and len(patient_name.strip()) >= 3):
         return {"ok": False, "reason": "need_name"}
 
     d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     h, m = map(int, time_hhmm.split(":"))
-
-    tz = ZoneInfo(getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey")
-
-    # Hora local aware
-    start_dt_local = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
-
-    # Convertir a UTC naive para DB
-    start_dt_utc_naive = start_dt_local.astimezone(datetime.utcnow().astimezone().tzinfo).astimezone().replace(tzinfo=None)
+    tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
+    tz = ZoneInfo(tzname)
+    start_dt = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
 
     for db in db_session():
-        slots = available_slots(db, d, getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey") or []
+        # validar slot
+        slots = available_slots(db, d, tzname) or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
+            logger.info("Slot no disponible: %s %s (contact=%s) alternatives=%s", date_iso, time_hhmm, contact, [s.strftime("%H:%M") for s in slots])
             return {"ok": False, "reason": "slot_unavailable", "alternatives": [s.strftime("%H:%M") for s in slots]}
 
         patient = get_or_create_patient(db, contact)
         patient.name = patient_name.strip().title()
         db.commit()
 
-        # Guardar en DB en UTC naive
-        appt = move_or_create_appointment(db, patient, start_dt_utc_naive)
+        appt = move_or_create_appointment(db, patient, start_dt)
         appt.status = models.AppointmentStatus.confirmed
 
+        created_event_id = None
         if not appt.event_id:
             try:
-                # Mandar a Calendar con hora local aware
-                ev_id = create_event(
+                logger.info("Creando evento en Calendar: contact=%s patient=%s start_local=%s tz=%s", contact, patient.name, appt.start_at.isoformat(), tzname)
+                created_event_id = create_event(
                     summary=f"Consulta — {patient.name or 'Paciente'}",
-                    start_local=start_dt_local,
+                    start_local=appt.start_at,  # aware con tz local
                     duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
                     location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
                     description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
                 )
-                appt.event_id = ev_id
+                appt.event_id = created_event_id
+                logger.info("Evento creado OK: event_id=%s (appt_id=%s)", created_event_id, getattr(appt, "id", None))
             except Exception as e:
-                logger.exception("create_event falló: %s", e)
+                logger.exception("create_event falló contact=%s appt_id=%s: %s", contact, getattr(appt, "id", None), e)
 
         db.commit()
-        return {"ok": True, "patient_name": patient.name or "", "date_iso": date_iso, "time_hhmm": time_hhmm}
+        logger.info("Cita confirmada en DB: appt_id=%s contact=%s start_at=%s event_id=%s", getattr(appt, "id", None), contact, appt.start_at.isoformat(), appt.event_id)
+
+        return {
+            "ok": True,
+            "patient_name": patient.name or "",
+            "date_iso": date_iso,
+            "time_hhmm": time_hhmm,
+            "event_id": appt.event_id or created_event_id or None
+        }
 
 def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, client_request_id: str):
     d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     h, m = map(int, time_hhmm.split(":"))
-
-    tz = ZoneInfo(getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey")
-
-    start_dt_local = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
-    start_dt_utc_naive = start_dt_local.astimezone(datetime.utcnow().astimezone().tzinfo).astimezone().replace(tzinfo=None)
+    tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
+    tz = ZoneInfo(tzname)
+    start_dt = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
 
     for db in db_session():
         appt = find_latest_active_for_contact(db, contact)
         if not appt:
+            logger.info("Reagendar pero sin cita activa: contact=%s", contact)
             return {"ok": False, "reason": "no_active"}
 
-        slots = available_slots(db, d, getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey") or []
+        slots = available_slots(db, d, tzname) or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
+            logger.info("Reschedule slot no disponible: %s %s (contact=%s)", date_iso, time_hhmm, contact)
             return {"ok": False, "reason": "slot_unavailable", "alternatives": [s.strftime("%H:%M") for s in slots]}
 
-        # Actualizar DB en UTC naive
-        appt.start_at = start_dt_utc_naive
+        # Actualiza fecha/hora en DB
+        appt.start_at = start_dt
 
-        # ❗️(Opcional) aquí podrías también actualizar en Google Calendar si lo deseas
+        # Sin update_event, reflejamos en Calendar borrando y recreando
+        try:
+            if appt.event_id:
+                logger.info("Eliminando evento previo para reagendar: event_id=%s", appt.event_id)
+                delete_event(appt.event_id)
+                appt.event_id = None
+        except Exception as e:
+            logger.exception("delete_event falló durante reschedule (contact=%s): %s", contact, e)
+
+        new_event_id = None
+        try:
+            logger.info("Creando evento (reschedule) contact=%s start_local=%s tz=%s", contact, appt.start_at.isoformat(), tzname)
+            # Busca nombre paciente para el summary
+            patient = db.query(models.Patient).filter(models.Patient.id == appt.patient_id).first()
+            pname = getattr(patient, "name", None) or "Paciente"
+            new_event_id = create_event(
+                summary=f"Consulta — {pname}",
+                start_local=appt.start_at,
+                duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
+                location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
+                description=f"Canal: WhatsApp\nPaciente: {pname}"
+            )
+            appt.event_id = new_event_id
+            logger.info("Evento creado (reschedule) OK: event_id=%s appt_id=%s", new_event_id, getattr(appt, "id", None))
+        except Exception as e:
+            logger.exception("create_event falló durante reschedule (contact=%s): %s", contact, e)
 
         db.commit()
-        return {"ok": True, "date_iso": date_iso, "time_hhmm": time_hhmm}
+        return {"ok": True, "date_iso": date_iso, "time_hhmm": time_hhmm, "event_id": appt.event_id or new_event_id or None}
 
 def tool_cancel_appointment(contact: str):
     for db in db_session():
@@ -273,6 +305,7 @@ def tool_cancel_appointment(contact: str):
         if appt.event_id:
             try:
                 delete_event(appt.event_id)
+                logger.info("Evento eliminado OK: event_id=%s appt_id=%s", appt.event_id, getattr(appt, "id", None))
             except Exception as e:
                 logger.exception("delete_event falló: %s", e)
             appt.event_id = None
