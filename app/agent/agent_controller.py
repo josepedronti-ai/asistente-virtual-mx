@@ -313,11 +313,13 @@ SYSTEM_PROMPT = (
          DEBES llamar a la tool `parse_date` para obtener `YYYY-MM-DD` (preferir futuro).
     3) Normalización de horas:
        - Si el usuario escribe “8 pm”/“ocho y media”, normaliza a HH:MM 24h (puedes usar `parse_time` si lo necesitas).
-    4) Confirmación de cita:
-       - **Nunca** confirmes sin eco explícito de **FECHA + HORA + NOMBRE**.
-       - Si no tienes nombre, **primero** pide: “Para confirmar, ¿me comparte el nombre y apellido del paciente, por favor?”.
-       - Tras recibir el nombre, confirma con formato claro:
-         “Quedó para el 📅 DD/MM/AAAA a las ⏰ HH:MM a nombre de NOMBRE.”
+    4) Flujo de recolección de datos (no intrusivo, por etapas):
+        - Si el usuario pide **agendar** y no ha dado fecha: pide **solo la fecha** (“¿Para qué fecha le gustaría?”) o ofrece consultar mañana/esta semana.
+        - Con fecha ya clara, consulta `check_slots` y ofrece 4–8 horarios del día.
+        - Cuando elija **hora**, entonces y solo entonces pide el **nombre y apellido** para confirmar: 
+            “Para confirmar, ¿me comparte el nombre y apellido del paciente, por favor?”.
+        - Confirmación final SIEMPRE con los tres datos: 
+            “Quedó para el 📅 DD/MM/AAAA a las ⏰ HH:MM a nombre de NOMBRE.”
     5) Horario no disponible:
        - Si el servidor indica `slot_unavailable`, ofrece 4–8 alternativas del mismo día.
     6) Reprogramación/cancelación:
@@ -438,11 +440,14 @@ def _force_parse_date_if_needed(user_text: str, today_iso: str) -> dict | None:
     """
     t = _norm(user_text)
     claves = [
-        "hoy", "mañana", "manana", "pasado mañana", "pasado manana",
-        "próximo", "proximo", "esta semana", "la siguiente semana",
-        "este", "próxima", "proxima", "siguiente", "el lunes", "el martes",
-        "el miercoles", "el miércoles", "el jueves", "el viernes", "el sabado",
-        "el sábado", "el domingo"
+        "hoy",
+        "mañana", "manana", "el día de mañana", "el dia de manana", "para mañana", "para manana",
+        "pasado mañana", "pasado manana",
+        "próximo", "proximo", "próxima", "proxima",
+        "esta semana", "la siguiente semana", "siguiente semana",
+        "este", "siguiente",
+        "el lunes", "el martes", "el miercoles", "el miércoles", "el jueves",
+        "el viernes", "el sabado", "el sábado", "el domingo"
     ]
     if any(p in t for p in claves):
         return {
