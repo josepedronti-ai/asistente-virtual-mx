@@ -3,6 +3,7 @@ from __future__ import annotations
 import os, json, re, unicodedata, uuid
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
+import logging
 
 from openai import OpenAI
 
@@ -16,6 +17,8 @@ try:
     from dateparser import parse as dp_parse
 except Exception:
     dp_parse = None  # la tool parse_date fallará con mensaje si no está instalado
+
+logger = logging.getLogger(__name__)
 
 # -----------------------
 # Memoria simple por contacto
@@ -185,21 +188,26 @@ def hhmm_from_text_or_none(text: str) -> str | None:
 def tool_check_slots(contact: str, date_iso: str):
     d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     for db in db_session():
-        slots = available_slots(db, d, settings.TIMEZONE) or []
+        slots = available_slots(db, d, getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey") or []
         return {"date_iso": date_iso, "slots": [s.strftime("%H:%M") for s in slots]}
 
 def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_name: str, channel: str, client_request_id: str):
-    # Validación básica
     if not (patient_name and patient_name.strip() and len(patient_name.strip()) >= 3):
         return {"ok": False, "reason": "need_name"}
 
     d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     h, m = map(int, time_hhmm.split(":"))
-    start_dt = datetime.combine(d, datetime.min.time()).replace(hour=h, minute=m)
+
+    tz = ZoneInfo(getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey")
+
+    # Hora local aware
+    start_dt_local = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
+
+    # Convertir a UTC naive para DB
+    start_dt_utc_naive = start_dt_local.astimezone(datetime.utcnow().astimezone().tzinfo).astimezone().replace(tzinfo=None)
 
     for db in db_session():
-        # validar slot
-        slots = available_slots(db, d, settings.TIMEZONE) or []
+        slots = available_slots(db, d, getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey") or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
             return {"ok": False, "reason": "slot_unavailable", "alternatives": [s.strftime("%H:%M") for s in slots]}
@@ -208,43 +216,51 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
         patient.name = patient_name.strip().title()
         db.commit()
 
-        appt = move_or_create_appointment(db, patient, start_dt)
+        # Guardar en DB en UTC naive
+        appt = move_or_create_appointment(db, patient, start_dt_utc_naive)
         appt.status = models.AppointmentStatus.confirmed
 
         if not appt.event_id:
             try:
+                # Mandar a Calendar con hora local aware
                 ev_id = create_event(
                     summary=f"Consulta — {patient.name or 'Paciente'}",
-                    start_local=appt.start_at,
+                    start_local=start_dt_local,
                     duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
                     location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
                     description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
                 )
                 appt.event_id = ev_id
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("create_event falló: %s", e)
 
         db.commit()
-        return {
-            "ok": True,
-            "patient_name": patient.name or "",
-            "date_iso": date_iso,
-            "time_hhmm": time_hhmm
-        }
+        return {"ok": True, "patient_name": patient.name or "", "date_iso": date_iso, "time_hhmm": time_hhmm}
 
 def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, client_request_id: str):
     d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     h, m = map(int, time_hhmm.split(":"))
-    start_dt = datetime.combine(d, datetime.min.time()).replace(hour=h, minute=m)
+
+    tz = ZoneInfo(getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey")
+
+    start_dt_local = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
+    start_dt_utc_naive = start_dt_local.astimezone(datetime.utcnow().astimezone().tzinfo).astimezone().replace(tzinfo=None)
+
     for db in db_session():
         appt = find_latest_active_for_contact(db, contact)
         if not appt:
             return {"ok": False, "reason": "no_active"}
-        slots = available_slots(db, d, settings.TIMEZONE) or []
+
+        slots = available_slots(db, d, getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey") or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
             return {"ok": False, "reason": "slot_unavailable", "alternatives": [s.strftime("%H:%M") for s in slots]}
-        appt.start_at = start_dt
+
+        # Actualizar DB en UTC naive
+        appt.start_at = start_dt_utc_naive
+
+        # ❗️(Opcional) aquí podrías también actualizar en Google Calendar si lo deseas
+
         db.commit()
         return {"ok": True, "date_iso": date_iso, "time_hhmm": time_hhmm}
 
@@ -257,8 +273,8 @@ def tool_cancel_appointment(contact: str):
         if appt.event_id:
             try:
                 delete_event(appt.event_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("delete_event falló: %s", e)
             appt.event_id = None
         db.commit()
         return {"ok": True}
@@ -555,8 +571,10 @@ def run_agent(contact: str, user_text: str) -> str:
                 tools=TOOLS,
                 tool_choice="auto",
                 temperature=0.2,
+                timeout=20,  # evita timeouts del webhook
             )
-        except Exception:
+        except Exception as e:
+            logger.exception("OpenAI falló: %s", e)
             return "Tuve un problema con el servicio de IA. ¿Desea que lo intente de nuevo o prefiere hablar con recepción?"
 
         msg = resp.choices[0].message
@@ -586,7 +604,8 @@ def run_agent(contact: str, user_text: str) -> str:
 
                 try:
                     result = _dispatch_tool(contact, name, args)
-                except Exception:
+                except Exception as e:
+                    logger.exception("Tool %s lanzó excepción: %s", name, e)
                     result = {"ok": False, "error": f"tool_exception:{name}"}
 
                 messages.append({
@@ -602,10 +621,22 @@ def run_agent(contact: str, user_text: str) -> str:
         if not final_text:
             final_text = "Por ahora no pude completar la acción. ¿Desea que intentemos nuevamente o prefiere hablar con recepción?"
 
-        # Guardamos para no repetir presentación en futuros saludos
+        # Normalizaciones menores de UX (evita separadores '|' y espacios repetidos)
+        try:
+            # Quita tuberías y espacios alrededor
+            final_text = re.sub(r"\s*\|\s*", " ", final_text)
+            # Compacta espacios múltiples
+            final_text = re.sub(r"\s{2,}", " ", final_text).strip()
+            # Limpia puntos medios repetidos (por si el modelo produce '·  ·')
+            final_text = re.sub(r"(·\s*){2,}", "· ", final_text)
+        except Exception:
+            pass
+
+        # Guarda para no repetir presentación en futuros saludos
         messages.append({"role": "assistant", "content": final_text})
         _save_mem(contact, messages, greeted=True)
         return final_text
 
+    # Si se exceden los hops de herramientas sin respuesta final
     _save_mem(contact, messages, greeted=True)
     return "Tuve un problema para cerrar la operación. ¿Desea que lo intente de nuevo o prefiere hablar con recepción?"
