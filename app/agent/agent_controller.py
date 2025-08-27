@@ -513,6 +513,8 @@ def _daypart_label(hour: int) -> str:
 def _build_greeting() -> str:
     h = _now_local().hour
     tramo = _daypart_label(h)
+    if tramo == "días":
+        return "Hola, buenos días. Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?"
     return f"Hola, buenas {tramo}. Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?"
 
 def _server_normalize_date_hint(text: str, today_iso: str | None = None) -> str | None:

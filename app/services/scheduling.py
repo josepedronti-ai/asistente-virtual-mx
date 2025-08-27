@@ -1,6 +1,6 @@
 # app/services/scheduling.py
 from __future__ import annotations
-import os, json
+import os, json, logging
 from datetime import datetime, date, time, timedelta
 from typing import List, Optional
 
@@ -11,9 +11,20 @@ from google.oauth2 import service_account
 from ..config import settings
 from .. import models  # para leer citas reservadas/confirmadas en BD
 
+logger = logging.getLogger(__name__)
+
 # ====== Config ======
-CALENDAR_ID = getattr(settings, "GCAL_CALENDAR_ID", "")
-TIMEZONE = getattr(settings, "TIMEZONE", "America/Mexico_City")
+# Compat: aceptamos ambos nombres de env para el mismo propósito
+CALENDAR_ID = (
+    getattr(settings, "GOOGLE_CALENDAR_ID", "")
+    or getattr(settings, "GCAL_CALENDAR_ID", "")
+)
+if not CALENDAR_ID:
+    logger.warning("GOOGLE_CALENDAR_ID/GCAL_CALENDAR_ID no definido: usando 'primary'.")
+    CALENDAR_ID = "primary"
+
+# Usa una sola TZ en toda la integración
+TIMEZONE = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
 
 # Horario de consultorio (acepta OPEN/CLOSE o START/END por compatibilidad)
 CLINIC_OPEN_HOUR = getattr(settings, "CLINIC_OPEN_HOUR", getattr(settings, "CLINIC_START_HOUR", 16))
@@ -57,6 +68,7 @@ def _get_service():
     if _service_cache is None:
         creds = _load_credentials()
         _service_cache = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        logger.info("Google Calendar client inicializado. CALENDAR_ID=%s TZ=%s", CALENDAR_ID, TIMEZONE)
     return _service_cache
 
 # ====== Utilidades de tiempo ======
@@ -76,6 +88,22 @@ def _to_iso(dt_local: datetime) -> str:
 def _overlaps(a_start, a_end, b_start, b_end):
     return not (a_end <= b_start or b_end <= a_start)
 
+def _iso_to_dt(s: str) -> datetime:
+    """
+    Convierte iso de Google (que puede traer 'Z') a datetime aware y lo pasa a TZ local.
+    """
+    try:
+        # Soporta 'Z' (UTC)
+        s2 = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+    except Exception:
+        # fallback ultra conservador
+        dt = datetime.strptime(s.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+        dt = dt.replace(tzinfo=pytz.UTC)
+    if dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt)
+    return dt.astimezone(_local_tz())
+
 # ====== Busy windows: Google Calendar + BD ======
 def _get_busy_windows_gcal(day: date) -> List[tuple[datetime, datetime]]:
     """
@@ -93,22 +121,15 @@ def _get_busy_windows_gcal(day: date) -> List[tuple[datetime, datetime]]:
         "timeZone": TIMEZONE,
         "items": [{"id": CALENDAR_ID}],
     }
+    logger.debug("GCAL freebusy request: %s", body)
     resp = service.freebusy().query(body=body).execute()
     busy = resp["calendars"][CALENDAR_ID]["busy"]
     out = []
     for b in busy:
-        bs = datetime.fromisoformat(b["start"])
-        be = datetime.fromisoformat(b["end"])
-        # normaliza a zona local
-        if bs.tzinfo is None:
-            bs = tz.localize(bs)
-        else:
-            bs = bs.astimezone(tz)
-        if be.tzinfo is None:
-            be = tz.localize(be)
-        else:
-            be = be.astimezone(tz)
+        bs = _iso_to_dt(b["start"])
+        be = _iso_to_dt(b["end"])
         out.append((bs, be))
+    logger.debug("GCAL freebusy busy_windows=%s", [(a.isoformat(), b.isoformat()) for a,b in out])
     return out
 
 def _get_busy_windows_db(db_session, day: date) -> List[tuple[datetime, datetime]]:
@@ -122,10 +143,15 @@ def _get_busy_windows_db(db_session, day: date) -> List[tuple[datetime, datetime
     day_start = tz.localize(datetime.combine(day, time(0, 0)))
     day_end   = day_start + timedelta(days=1)
 
+    # Nota: si tu columna es naive local, comparamos en naive; si es aware, comparamos aware.
+    # Aquí hacemos el approach naive-local para máxima compatibilidad histórica:
+    q_start = day_start.replace(tzinfo=None)
+    q_end   = day_end.replace(tzinfo=None)
+
     appts = (
         db_session.query(models.Appointment)
-        .filter(models.Appointment.start_at >= day_start.replace(tzinfo=None))
-        .filter(models.Appointment.start_at <  day_end.replace(tzinfo=None))
+        .filter(models.Appointment.start_at >= q_start)
+        .filter(models.Appointment.start_at <  q_end)
         .filter(models.Appointment.status.in_([
             models.AppointmentStatus.reserved,
             models.AppointmentStatus.confirmed,
@@ -135,12 +161,15 @@ def _get_busy_windows_db(db_session, day: date) -> List[tuple[datetime, datetime
 
     out = []
     for ap in appts:
-        # En la BD guardamos naive en hora local; conviértelo a aware local
         start_local = ap.start_at
+        # Si la BD guarda naive (local), localiza; si ya viene aware, pasa a TZ local
         if start_local.tzinfo is None:
             start_local = tz.localize(start_local)
+        else:
+            start_local = start_local.astimezone(tz)
         end_local = start_local + timedelta(minutes=DEFAULT_EVENT_DURATION_MIN)
         out.append((start_local, end_local))
+    logger.debug("DB busy_windows=%s", [(a.isoformat(), b.isoformat()) for a,b in out])
     return out
 
 # ====== Slots disponibles ======
@@ -182,48 +211,71 @@ def create_event(summary: str, start_local: datetime, duration_min: int = DEFAUL
                  location: str = "", description: str = "") -> str:
     """
     Crea un evento en el calendario y devuelve su eventId.
-    start_local debe ser tz-aware en TIMEZONE.
+    start_local puede venir naive local o aware; se normaliza a TZ local.
     """
     service = _get_service()
+    tz = _local_tz()
+
     if start_local.tzinfo is None:
-        start_local = _localize(start_local)
+        start_local = tz.localize(start_local)
+    else:
+        start_local = start_local.astimezone(tz)
+
     end_local = start_local + timedelta(minutes=duration_min)
 
     body = {
         "summary": summary,
         "start": {"dateTime": start_local.isoformat(), "timeZone": TIMEZONE},
-        "end": {"dateTime": end_local.isoformat(), "timeZone": TIMEZONE},
+        "end":   {"dateTime": end_local.isoformat(),   "timeZone": TIMEZONE},
         "location": location or "",
         "description": description or "",
     }
-    ev = service.events().insert(calendarId=CALENDAR_ID, body=body).execute()
-    return ev["id"]
+
+    logger.info("GCAL create_event request: calendar_id=%s start=%s end=%s tz=%s body=%s",
+                CALENDAR_ID, start_local.isoformat(), end_local.isoformat(), TIMEZONE, body)
+
+    ev = service.events().insert(calendarId=CALENDAR_ID, body=body, supportsAttachments=False).execute()
+    event_id = ev.get("id")
+    html_link = ev.get("htmlLink")
+    logger.info("GCAL create_event OK: event_id=%s htmlLink=%s", event_id, html_link)
+    return event_id
 
 def update_event(event_id: str, new_start_local: datetime, duration_min: int = DEFAULT_EVENT_DURATION_MIN) -> str:
     """
     Mueve/actualiza un evento existente. Devuelve el eventId (igual).
     """
     service = _get_service()
+    tz = _local_tz()
+
     if new_start_local.tzinfo is None:
-        new_start_local = _localize(new_start_local)
+        new_start_local = tz.localize(new_start_local)
+    else:
+        new_start_local = new_start_local.astimezone(tz)
+
     new_end = new_start_local + timedelta(minutes=duration_min)
 
     body = {
         "start": {"dateTime": new_start_local.isoformat(), "timeZone": TIMEZONE},
-        "end": {"dateTime": new_end.isoformat(), "timeZone": TIMEZONE},
+        "end":   {"dateTime": new_end.isoformat(),         "timeZone": TIMEZONE},
     }
+
+    logger.info("GCAL update_event request: calendar_id=%s event_id=%s body=%s",
+                CALENDAR_ID, event_id, body)
+
     ev = service.events().patch(calendarId=CALENDAR_ID, eventId=event_id, body=body).execute()
+    logger.info("GCAL update_event OK: event_id=%s", ev.get("id"))
     return ev["id"]
 
 def delete_event(event_id: str):
     """Elimina un evento por id (idempotente)."""
     service = _get_service()
+    logger.info("GCAL delete_event: calendar_id=%s event_id=%s", CALENDAR_ID, event_id)
     try:
         service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
-    except Exception:
-        # Si ya no existe, lo ignoramos para que sea idempotente
-        pass
-
+        logger.info("GCAL delete_event OK: event_id=%s", event_id)
+    except Exception as e:
+        # Si ya no existe, lo ignoramos para que sea idempotente, pero lo registramos
+        logger.warning("GCAL delete_event WARN (puede no existir): event_id=%s err=%s", event_id, e)
 
 # ====== Diagnóstico manual ======
 if __name__ == "__main__":
@@ -232,7 +284,7 @@ if __name__ == "__main__":
     print(f"=== Diagnóstico Google Calendar ===")
     try:
         print(f"TIMEZONE: {TIMEZONE}")
-        print(f"GCAL_CALENDAR_ID: {CALENDAR_ID}")
+        print(f"CALENDAR_ID: {CALENDAR_ID}")
 
         svc = _get_service()
         cal = svc.calendars().get(calendarId=CALENDAR_ID).execute()
