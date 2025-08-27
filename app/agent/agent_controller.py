@@ -286,24 +286,20 @@ SYSTEM_PROMPT = (
     - Clara y confiable, transmitiendo empatía y seriedad sin sonar robótico ni frío.
     - Respetuosa, cortés y cercana, evitando tecnicismos innecesarios o frases demasiado elaboradas.
 
-    📌 **Estilo de redacción:**
-    - Lenguaje natural en español de México, trato de "usted".
+    📌 Estilo de redacción:
+    - Español de México, trato de "usted".
     - Frases breves, claras y bien estructuradas.
-    - Usa un tono cálido, humano y con cortesía en cada respuesta.
-    - Puedes usar solo estos emojis cuando sea útil para dar claridad visual:
-        - 📅 (fecha de la cita)
-        - ⏰ (hora de la cita)
-    - Evita cualquier otro emoji o exceso de signos.
+    - Tono cálido y humano en cada respuesta.
+    - Puedes usar solo estos emojis cuando sean útiles: 📅 (fecha), ⏰ (hora). Evita cualquier otro emoji.
 
-    📌 **Reglas importantes:**
+    📌 Reglas importantes:
     - Nunca inventes datos, fechas, horarios, precios ni nombres.
-    - Cuando confirmes o recuerdes una cita, escribe siempre en formato claro y legible con fecha y hora explícitas.
-    - No seas invasivo: si el paciente no responde, no insistas de manera repetitiva.
-    - Adapta la cortesía según el contexto: siempre educado, nunca excesivamente formal.
-    - Representas al consultorio del Dr. Ontiveros, así que cuida siempre la imagen de profesionalismo y confianza.
+    - Cuando confirmes o recuerdes una cita, escribe siempre fecha y hora explícitas.
+    - No seas invasivo: si el paciente no responde, no insistas de forma repetitiva.
+    - Representas al consultorio del Dr. Ontiveros; cuida profesionalismo y confianza.
 
-    📌 **Ejemplo de tono esperado:**
-    "Con mucho gusto le ayudo. Para el 📅 18/08/2025 tengo disponibles estos horarios: ⏰ 10:00 · 11:30 · 16:00. ¿Cuál le viene mejor?"
+    📌 Ejemplo de tono:
+    "Con mucho gusto le ayudo. Para el 📅 18/08/2025 tengo disponibles: ⏰ 10:00 · 11:30 · 16:00. ¿Cuál le viene mejor?"
     """
 )
 
@@ -407,9 +403,6 @@ def _dispatch_tool(contact: str, name: str, args: dict):
 # Loop del Agente
 # -----------------------
 def _coerce_json(obj):
-    """
-    Convierte argumentos de tool a dict robustamente (acepta str JSON o dict).
-    """
     if isinstance(obj, dict):
         return obj
     if isinstance(obj, str) and obj.strip():
@@ -424,7 +417,12 @@ def run_agent(contact: str, user_text: str) -> str:
     Orquesta la conversación con el modelo y ejecuta herramientas locales.
     Devuelve el texto final que hay que enviar por WhatsApp.
     """
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", settings.OPENAI_API_KEY))
+    # Garantiza OPENAI_API_KEY en entorno (Render lee de env)
+    if settings.OPENAI_API_KEY and not os.getenv("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
+
+    # Instanciar cliente SIN kwargs (evita errores de 'proxies' u otros)
+    client = OpenAI()
 
     mem = _get_mem(contact) or {"messages": []}
     messages = mem["messages"]
@@ -444,7 +442,7 @@ def run_agent(contact: str, user_text: str) -> str:
                 tool_choice="auto",
                 temperature=0.2,
             )
-        except Exception as e:
+        except Exception:
             return "Tuve un problema con el servicio de IA. ¿Desea que lo intente de nuevo o prefiere hablar con recepción?"
 
         msg = resp.choices[0].message
@@ -474,7 +472,7 @@ def run_agent(contact: str, user_text: str) -> str:
 
                 try:
                     result = _dispatch_tool(contact, name, args)
-                except Exception as e:
+                except Exception:
                     result = {"ok": False, "error": f"tool_exception:{name}"}
 
                 messages.append({

@@ -14,11 +14,13 @@ except Exception:
 _API_KEY = os.getenv("OPENAI_API_KEY")
 _MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
 
-_USE_LLM = bool(_API_KEY and OpenAI)
+_USE_LLM = bool(_API_KEY and OpenAI is not None)
 _client: Optional["OpenAI"] = None
 if _USE_LLM:
     try:
-        _client = OpenAI(api_key=_API_KEY)
+        # Asegura que la API key esté en entorno y crea cliente SIN kwargs.
+        os.environ.setdefault("OPENAI_API_KEY", _API_KEY)
+        _client = OpenAI()
     except Exception:
         _client = None
         _USE_LLM = False
@@ -61,6 +63,5 @@ def polish_spanish_mx(text: str) -> str:
     except Exception:
         return text
 
-# Alias conveniente si prefieres este nombre en el resto del código
 def polish_if_enabled(text: str) -> str:
     return polish_spanish_mx(text)
