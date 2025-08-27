@@ -418,6 +418,38 @@ def _dispatch_tool(contact: str, name: str, args: dict):
     return {"error": f"unknown_tool:{name}"}
 
 # -----------------------
+# UX Hook: forzar parse_date si el mensaje es relativo/ambiguo
+# -----------------------
+def _force_parse_date_if_needed(user_text: str, today_iso: str) -> dict | None:
+    """
+    Detecta palabras/expresiones relativas y fuerza un tool_call de parse_date,
+    para que la normalización de la fecha sea 100% del lado servidor.
+    """
+    t = _norm(user_text)
+    # claves típicas de relativa/ambigua
+    claves = [
+        "hoy", "mañana", "manana", "pasado mañana", "pasado manana",
+        "próximo", "proximo", "esta semana", "la siguiente semana",
+        "este", "próxima", "proxima", "siguiente", "el lunes", "el martes",
+        "el miercoles", "el miércoles", "el jueves", "el viernes", "el sabado",
+        "el sábado", "el domingo"
+    ]
+    if any(p in t for p in claves):
+        return {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": f"force-parse-{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": "parse_date",
+                    "arguments": json.dumps({"text": user_text, "today_iso": today_iso}, ensure_ascii=False)
+                }
+            }],
+            "content": ""
+        }
+    return None
+
+# -----------------------
 # Loop del Agente
 # -----------------------
 def _coerce_json(obj):
@@ -449,6 +481,11 @@ def run_agent(contact: str, user_text: str) -> str:
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
     messages.append({"role": "user", "content": user_text})
+
+    # 🔹 Hook: forzar parse_date si detectamos “hoy/mañana/próximo…”
+    auto_date_call = _force_parse_date_if_needed(user_text, datetime.utcnow().date().isoformat())
+    if auto_date_call:
+        messages.append(auto_date_call)
 
     max_tool_hops = 8
     for _ in range(max_tool_hops):
