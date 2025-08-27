@@ -309,17 +309,18 @@ SYSTEM_PROMPT = (
     REGLAS CRÍTICAS
     1) Jamás inventes disponibilidad: usa siempre herramientas para consultar horarios.
     2) Normalización de fechas:
-       - Cuando el usuario escriba “hoy”, “mañana”, “próximo lunes”, fechas sueltas o ambiguas,
-         DEBES llamar a la tool `parse_date` para obtener `YYYY-MM-DD` (preferir futuro).
+       - Si el mensaje del usuario incluye un tag con el siguiente formato: [HINT_FECHA:YYYY-MM-DD],
+         debes usar **esa** fecha como interpretación de términos relativos (“hoy”, “mañana”, “próximo lunes”, etc.).
+       - En caso contrario, y si la fecha está ambigua, puedes llamar a la tool `parse_date`.
     3) Normalización de horas:
        - Si el usuario escribe “8 pm”/“ocho y media”, normaliza a HH:MM 24h (puedes usar `parse_time` si lo necesitas).
-    4) Flujo de recolección de datos (no intrusivo, por etapas):
-        - Si el usuario pide **agendar** y no ha dado fecha: pide **solo la fecha** (“¿Para qué fecha le gustaría?”) o ofrece consultar mañana/esta semana.
-        - Con fecha ya clara, consulta `check_slots` y ofrece 4–8 horarios del día.
-        - Cuando elija **hora**, entonces y solo entonces pide el **nombre y apellido** para confirmar: 
-            “Para confirmar, ¿me comparte el nombre y apellido del paciente, por favor?”.
-        - Confirmación final SIEMPRE con los tres datos: 
-            “Quedó para el 📅 DD/MM/AAAA a las ⏰ HH:MM a nombre de NOMBRE.”
+    4) Flujo no intrusivo al agendar:
+       - Paso 1: pide **solo la fecha** (si no está clara).
+       - Paso 2: luego pide **la hora**.
+       - Paso 3: por último pide **nombre y apellido** del paciente para confirmar.
+       - **Nunca** confirmes sin eco explícito de **FECHA + HORA + NOMBRE**.
+       - Frase sugerida para el nombre: “Para confirmar, ¿me comparte el nombre y apellido del paciente, por favor?”.
+       - Confirmación: “Quedó para el 📅 DD/MM/AAAA a las ⏰ HH:MM a nombre de NOMBRE.”
     5) Horario no disponible:
        - Si el servidor indica `slot_unavailable`, ofrece 4–8 alternativas del mismo día.
     6) Reprogramación/cancelación:
@@ -431,39 +432,8 @@ def _dispatch_tool(contact: str, name: str, args: dict):
     return {"error": f"unknown_tool:{name}"}
 
 # -----------------------
-# UX Hooks
+# UX helpers
 # -----------------------
-def _force_parse_date_if_needed(user_text: str, today_iso: str) -> dict | None:
-    """
-    Detecta palabras/expresiones relativas y fuerza un tool_call de parse_date,
-    para que la normalización de la fecha sea 100% del lado servidor.
-    """
-    t = _norm(user_text)
-    claves = [
-        "hoy",
-        "mañana", "manana", "el día de mañana", "el dia de manana", "para mañana", "para manana",
-        "pasado mañana", "pasado manana",
-        "próximo", "proximo", "próxima", "proxima",
-        "esta semana", "la siguiente semana", "siguiente semana",
-        "este", "siguiente",
-        "el lunes", "el martes", "el miercoles", "el miércoles", "el jueves",
-        "el viernes", "el sabado", "el sábado", "el domingo"
-    ]
-    if any(p in t for p in claves):
-        return {
-            "role": "assistant",
-            "tool_calls": [{
-                "id": f"force-parse-{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": "parse_date",
-                    "arguments": json.dumps({"text": user_text, "today_iso": today_iso}, ensure_ascii=False)
-                }
-            }],
-            "content": ""
-        }
-    return None
-
 _GREETING_WORDS = (
     "hola", "buenos dias", "buenos días", "buenas", "buenas tardes",
     "buenas noches", "qué tal", "que tal", "saludos"
@@ -481,7 +451,7 @@ def _is_pure_greeting(user_text: str) -> bool:
     t = _norm(user_text)
     has_greeting = any(g in t for g in _GREETING_WORDS)
     has_intent = any(k in t for k in _INTENT_HINTS)
-    return has_greeting and not has_intent and len(t) <= 40  # mensajes cortos tipo “hola”, “buenas noches”
+    return has_greeting and not has_intent and len(t) <= 40
 
 def _daypart_label(hour: int) -> str:
     # días 06–11, tardes 12–18, noches 19–05
@@ -495,6 +465,33 @@ def _build_greeting() -> str:
     h = _now_local().hour
     tramo = _daypart_label(h)
     return f"Hola, buenas {tramo}. Soy el asistente del Dr. Ontiveros. ¿En qué puedo ayudarle hoy?"
+
+def _server_normalize_date_hint(text: str, today_iso: str | None = None) -> str | None:
+    """
+    Resuelve términos relativos tipo “hoy/mañana/próximo lunes…” a YYYY-MM-DD usando dateparser.
+    No hace tool_calls; retorna solo la fecha si se detecta y puede resolverse.
+    """
+    if not dp_parse:
+        return None
+    t = _norm(text)
+    patrones_relativos = [
+        "hoy", "mañana", "manana", "el dia de manana", "el día de mañana", "para mañana", "para manana",
+        "pasado mañana", "pasado manana",
+        "próximo", "proximo", "próxima", "proxima",
+        "esta semana", "la siguiente semana", "siguiente semana",
+        "este", "siguiente",
+        "el lunes", "el martes", "el miercoles", "el miércoles", "el jueves",
+        "el viernes", "el sabado", "el sábado", "el domingo"
+    ]
+    if not any(p in t for p in patrones_relativos):
+        return None
+    base = datetime.strptime(today_iso, "%Y-%m-%d") if today_iso else datetime.utcnow()
+    dt = dp_parse(
+        text,
+        languages=["es"],
+        settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": base, "DATE_ORDER": "DMY"},
+    )
+    return dt.date().isoformat() if dt else None
 
 # -----------------------
 # Loop del Agente
@@ -528,7 +525,6 @@ def run_agent(contact: str, user_text: str) -> str:
     # 🔹 Interceptor de saludo "puro" para presentación única
     if not greeted and _is_pure_greeting(user_text):
         greeting_text = _build_greeting()
-        # Registramos conversación mínima para contexto futuro
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         messages.append({"role": "user", "content": user_text})
@@ -540,13 +536,15 @@ def run_agent(contact: str, user_text: str) -> str:
     if not any(m.get("role") == "system" for m in messages):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
-    # Nuevo mensaje del usuario
-    messages.append({"role": "user", "content": user_text})
+    # Pre-normaliza fecha relativa del lado servidor (sin tool_calls)
+    today_iso = datetime.utcnow().date().isoformat()
+    date_hint = _server_normalize_date_hint(user_text, today_iso)
+    user_payload = user_text
+    if date_hint:
+        user_payload = f"{user_text}\n\n[HINT_FECHA:{date_hint}]"
 
-    # 🔹 Hook: forzar parse_date si detectamos “hoy/mañana/próximo…”
-    auto_date_call = _force_parse_date_if_needed(user_text, datetime.utcnow().date().isoformat())
-    if auto_date_call:
-        messages.append(auto_date_call)
+    # Nuevo mensaje del usuario (posible payload con HINT_FECHA)
+    messages.append({"role": "user", "content": user_payload})
 
     max_tool_hops = 8
     for _ in range(max_tool_hops):
@@ -606,7 +604,7 @@ def run_agent(contact: str, user_text: str) -> str:
 
         # Guardamos para no repetir presentación en futuros saludos
         messages.append({"role": "assistant", "content": final_text})
-        _save_mem(contact, messages, greeted=True)  # una vez que respondió, ya consideramos que se presentó/avanzó
+        _save_mem(contact, messages, greeted=True)
         return final_text
 
     _save_mem(contact, messages, greeted=True)
