@@ -20,7 +20,7 @@ from ..services.scheduling import (
     create_event,
 )
 
-router = APIRouter(tags=["admin"], prefix="/admin")
+router = APIRouter(tags=["admin"])
 
 def _require_admin(x_admin_token: str | None) -> None:
     expected = (settings.ADMIN_TOKEN or "").strip()

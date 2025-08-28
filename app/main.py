@@ -19,7 +19,6 @@ from .routers.admin import router as admin_router
 # LOGGING (pensado para Render)
 # Controla niveles con variables de entorno:
 #   LOG_LEVEL, AGENT_LOG_LEVEL, SQLA_LOG_LEVEL, UVICORN_LOG_LEVEL
-#   (ver notas al final)
 # ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -30,8 +29,7 @@ logging.basicConfig(
 logging.getLogger("app.agent.agent_controller").setLevel(
     getattr(logging, os.getenv("AGENT_LOG_LEVEL", "DEBUG"), logging.DEBUG)
 )
-
-# (Opcional) más/menos ruido de SQLAlchemy y Uvicorn en Render
+# (Opcional) ruido de SQLAlchemy y Uvicorn en Render
 logging.getLogger("sqlalchemy.engine").setLevel(
     getattr(logging, os.getenv("SQLA_LOG_LEVEL", "WARNING"), logging.WARNING)
 )
@@ -50,7 +48,7 @@ app = FastAPI(title=settings.APP_NAME)
 app.include_router(appointments_router)
 app.include_router(waitlist_router)
 app.include_router(webhooks_router)
-app.include_router(admin_router, prefix="/admin")  # <— importante
+app.include_router(admin_router, prefix="/admin")  # ← importante: el admin.py NO debe repetir /admin
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Endpoints de DEBUG (para pruebas end-to-end en Render)
