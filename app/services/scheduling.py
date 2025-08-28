@@ -93,11 +93,9 @@ def _iso_to_dt(s: str) -> datetime:
     Convierte iso de Google (que puede traer 'Z') a datetime aware y lo pasa a TZ local.
     """
     try:
-        # Soporta 'Z' (UTC)
         s2 = s.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s2)
     except Exception:
-        # fallback ultra conservador
         dt = datetime.strptime(s.split(".")[0], "%Y-%m-%dT%H:%M:%S")
         dt = dt.replace(tzinfo=pytz.UTC)
     if dt.tzinfo is None:
@@ -135,7 +133,6 @@ def _get_busy_windows_gcal(day: date) -> List[tuple[datetime, datetime]]:
 def _get_busy_windows_db(db_session, day: date) -> List[tuple[datetime, datetime]]:
     """
     Ventanas ocupadas por reservas en nuestra BD (reserved/confirmed) para ese día.
-    Útil para evitar doble booking antes de crear el evento en Calendar.
     """
     if db_session is None:
         return []
@@ -143,8 +140,7 @@ def _get_busy_windows_db(db_session, day: date) -> List[tuple[datetime, datetime
     day_start = tz.localize(datetime.combine(day, time(0, 0)))
     day_end   = day_start + timedelta(days=1)
 
-    # Nota: si tu columna es naive local, comparamos en naive; si es aware, comparamos aware.
-    # Aquí hacemos el approach naive-local para máxima compatibilidad histórica:
+    # Si en BD guardas naive-local, compara en naive. Si guardas aware, adapta.
     q_start = day_start.replace(tzinfo=None)
     q_end   = day_end.replace(tzinfo=None)
 
@@ -162,7 +158,6 @@ def _get_busy_windows_db(db_session, day: date) -> List[tuple[datetime, datetime
     out = []
     for ap in appts:
         start_local = ap.start_at
-        # Si la BD guarda naive (local), localiza; si ya viene aware, pasa a TZ local
         if start_local.tzinfo is None:
             start_local = tz.localize(start_local)
         else:
@@ -177,7 +172,6 @@ def available_slots(db_session, day: date, timezone_str: Optional[str] = None) -
     """
     Genera slots de SLOT_MINUTES entre CLINIC_OPEN_HOUR y CLINIC_CLOSE_HOUR en zona local/`timezone_str`,
     y elimina los que interfieren con eventos ocupados del Google Calendar **y** reservas en BD.
-    Devuelve datetimes *tz-aware* en zona local listos para strftime.
     """
     tz = pytz.timezone(timezone_str or TIMEZONE)
 
@@ -195,12 +189,9 @@ def available_slots(db_session, day: date, timezone_str: Optional[str] = None) -
     while cur + delta <= end_local:
         slot_start = cur
         slot_end   = cur + delta
-
-        # si el slot se superpone con algo ocupado → descartar
         if any(_overlaps(slot_start, slot_end, b0, b1) for (b0, b1) in busy_windows):
             cur += delta
             continue
-
         slots.append(slot_start)
         cur += delta
 
@@ -274,38 +265,42 @@ def delete_event(event_id: str):
         service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
         logger.info("GCAL delete_event OK: event_id=%s", event_id)
     except Exception as e:
-        # Si ya no existe, lo ignoramos para que sea idempotente, pero lo registramos
         logger.warning("GCAL delete_event WARN (puede no existir): event_id=%s err=%s", event_id, e)
 
-# ====== Diagnóstico manual ======
-if __name__ == "__main__":
-    import traceback
+# ====== Helpers de diagnóstico para admin router ======
+def list_upcoming_events(limit: int = 10):
+    svc = _get_service()
+    tz = _local_tz()
+    now = datetime.now(tz).isoformat()
+    resp = svc.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=now,
+        maxResults=limit,
+        singleEvents=True,
+        orderBy="startTime"
+    ).execute()
+    items = resp.get("items", [])
+    out = []
+    for ev in items:
+        start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
+        out.append({
+            "id": ev.get("id"),
+            "summary": ev.get("summary"),
+            "start": start,
+            "htmlLink": ev.get("htmlLink"),
+        })
+    return out
 
-    print(f"=== Diagnóstico Google Calendar ===")
-    try:
-        print(f"TIMEZONE: {TIMEZONE}")
-        print(f"CALENDAR_ID: {CALENDAR_ID}")
-
-        svc = _get_service()
-        cal = svc.calendars().get(calendarId=CALENDAR_ID).execute()
-        print(f"Conectado a calendario: {cal.get('summary', '(sin summary)')}")
-
-        today = date.today()
-        for offset in range(0, 3):
-            d = today + timedelta(days=offset)
-            print(f"\n=== Slots para {d.isoformat()} | TZ={TIMEZONE} ===")
-            try:
-                slots = available_slots(None, d, TIMEZONE)
-                if not slots:
-                    print("(Sin disponibilidad o fuera de horario)")
-                else:
-                    for s in slots:
-                        print(s.strftime("%H:%M"))
-            except Exception as e:
-                print(f"ERROR al consultar slots: {e}")
-                traceback.print_exc()
-
-        print("\n✅ Prueba terminada.")
-    except Exception as e:
-        print(f"❌ Error general al inicializar o consultar Calendar: {e}")
-        traceback.print_exc()
+def freebusy_for_date(day: date):
+    tz = _local_tz()
+    start = tz.localize(datetime.combine(day, time(0,0)))
+    end   = start + timedelta(days=1)
+    svc = _get_service()
+    body = {
+        "timeMin": start.isoformat(),
+        "timeMax": end.isoformat(),
+        "timeZone": TIMEZONE,
+        "items": [{"id": CALENDAR_ID}],
+    }
+    resp = svc.freebusy().query(body=body).execute()
+    return resp.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
