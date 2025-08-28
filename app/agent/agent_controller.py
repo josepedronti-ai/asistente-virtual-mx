@@ -83,7 +83,10 @@ def find_latest_active_for_contact(db, contact: str):
         .first()
     )
 
-def move_or_create_appointment(db, patient: models.Patient, start_dt: datetime) -> models.Appointment:
+def move_or_create_appointment(db, patient: models.Patient, start_dt_naive_local: datetime) -> models.Appointment:
+    """
+    start_dt_naive_local: datetime SIN tzinfo (hora local de Monterrey/CDMX).
+    """
     appt = (
         db.query(models.Appointment)
         .filter(models.Appointment.patient_id == patient.id)
@@ -95,12 +98,12 @@ def move_or_create_appointment(db, patient: models.Patient, start_dt: datetime) 
         .first()
     )
     if appt:
-        appt.start_at = start_dt
+        appt.start_at = start_dt_naive_local
     else:
         appt = models.Appointment(
             patient_id=patient.id,
             type="consulta",
-            start_at=start_dt,
+            start_at=start_dt_naive_local,
             status=models.AppointmentStatus.reserved,
             channel=models.Channel.whatsapp,
         )
@@ -200,10 +203,14 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
     h, m = map(int, time_hhmm.split(":"))
     tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
     tz = ZoneInfo(tzname)
-    start_dt = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
+
+    # Aware local para cálculo/registro…
+    start_dt_local_aware = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
+    # …y lo que guardamos en BD: NAIVE LOCAL (evita que el driver convierta a UTC y “pierda” el tz)
+    start_dt_local_naive = start_dt_local_aware.replace(tzinfo=None)
 
     for db in db_session():
-        # validar slot
+        # validar slot (usa aware internamente/externamente, ok)
         slots = available_slots(db, d, tzname) or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
@@ -214,49 +221,36 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
         patient.name = patient_name.strip().title()
         db.commit()
 
-        appt = move_or_create_appointment(db, patient, start_dt)
+        appt = move_or_create_appointment(db, patient, start_dt_local_naive)
         appt.status = models.AppointmentStatus.confirmed
 
-        # --- Sincronizar con Google Calendar (update-or-create) ---
-        duration = getattr(settings, "EVENT_DURATION_MIN", 30)
-        try:
-            if appt.event_id:
-                try:
-                    update_event(appt.event_id, appt.start_at, duration_min=duration)
-                    logger.info("GCAL update_event OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
-                except Exception as e_upd:
-                    logger.warning("GCAL update_event falló; creando nuevo. appt_id=%s err=%s", getattr(appt, "id", None), e_upd)
-                    new_id = create_event(
-                        summary=f"Consulta — {patient.name or 'Paciente'}",
-                        start_local=appt.start_at,
-                        duration_min=duration,
-                        location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
-                        description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
-                    )
-                    appt.event_id = new_id
-                    logger.info("GCAL create_event por fallback OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
-            else:
-                new_id = create_event(
+        created_event_id = None
+        if not appt.event_id:
+            try:
+                logger.info("Creando evento en Calendar: contact=%s patient=%s start_local_naive=%s tz=%s",
+                            contact, patient.name, appt.start_at.isoformat(), tzname)
+                created_event_id = create_event(
                     summary=f"Consulta — {patient.name or 'Paciente'}",
-                    start_local=appt.start_at,
-                    duration_min=duration,
+                    start_local=appt.start_at,  # NAIVE LOCAL — scheduling.create_event lo localiza correctamente
+                    duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
                     location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
                     description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
                 )
-                appt.event_id = new_id
-                logger.info("GCAL create_event OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
-        except Exception as e:
-            logger.exception("Sincronización GCAL falló appt_id=%s: %s", getattr(appt, "id", None), e)
+                appt.event_id = created_event_id
+                logger.info("Evento creado OK: event_id=%s (appt_id=%s)", created_event_id, getattr(appt, "id", None))
+            except Exception as e:
+                logger.exception("create_event falló contact=%s appt_id=%s: %s", contact, getattr(appt, "id", None), e)
 
         db.commit()
-        logger.info("Cita confirmada en DB: appt_id=%s contact=%s start_at=%s event_id=%s", getattr(appt, "id", None), contact, appt.start_at.isoformat(), appt.event_id)
+        logger.info("Cita confirmada en DB: appt_id=%s contact=%s start_at_naive_local=%s event_id=%s",
+                    getattr(appt, "id", None), contact, appt.start_at.isoformat(), appt.event_id)
 
         return {
             "ok": True,
             "patient_name": patient.name or "",
             "date_iso": date_iso,
             "time_hhmm": time_hhmm,
-            "event_id": appt.event_id or None
+            "event_id": appt.event_id or created_event_id or None
         }
 
 def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, client_request_id: str):
@@ -264,7 +258,9 @@ def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, cli
     h, m = map(int, time_hhmm.split(":"))
     tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
     tz = ZoneInfo(tzname)
-    start_dt = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
+
+    start_dt_local_aware = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
+    start_dt_local_naive = start_dt_local_aware.replace(tzinfo=None)
 
     for db in db_session():
         appt = find_latest_active_for_contact(db, contact)
@@ -278,45 +274,40 @@ def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, cli
             logger.info("Reschedule slot no disponible: %s %s (contact=%s)", date_iso, time_hhmm, contact)
             return {"ok": False, "reason": "slot_unavailable", "alternatives": [s.strftime("%H:%M") for s in slots]}
 
-        # Actualiza fecha/hora en DB
-        appt.start_at = start_dt
+        # Actualiza fecha/hora en DB (naive local)
+        appt.start_at = start_dt_local_naive
 
-        # --- Update-or-create en Calendar ---
-        duration = getattr(settings, "EVENT_DURATION_MIN", 30)
+        # Intento de update; si falla (403), borramos y recreamos
         try:
             if appt.event_id:
                 try:
-                    update_event(appt.event_id, appt.start_at, duration_min=duration)
-                    logger.info("GCAL update_event OK (reschedule): appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
+                    logger.info("Intentando update_event GCAL: event_id=%s → %s %s (local)", appt.event_id, date_iso, time_hhmm)
+                    update_event(appt.event_id, start_dt_local_naive, duration_min=getattr(settings, "EVENT_DURATION_MIN", 30))
+                    logger.info("GCAL update_event OK: event_id=%s", appt.event_id)
                 except Exception as e_upd:
-                    logger.warning("GCAL update_event falló en reschedule; creando nuevo. appt_id=%s err=%s", getattr(appt, "id", None), e_upd)
-                    # reconstruye summary con nombre actual
-                    patient = db.query(models.Patient).filter(models.Patient.id == appt.patient_id).first()
-                    pname = getattr(patient, "name", None) or "Paciente"
-                    new_id = create_event(
-                        summary=f"Consulta — {pname}",
-                        start_local=appt.start_at,
-                        duration_min=duration,
-                        location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
-                        description=f"Canal: WhatsApp\nPaciente: {pname}"
-                    )
-                    appt.event_id = new_id
-                    logger.info("GCAL create_event (reschedule fallback) OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
-            else:
-                # no había event_id, crear
+                    logger.warning("GCAL update_event falló; creando nuevo. appt_id=%s err=%s", getattr(appt,"id",None), e_upd)
+                    delete_event(appt.event_id)
+                    appt.event_id = None
+        except Exception as e:
+            logger.exception("Fallo durante reschedule (delete/update): %s", e)
+            appt.event_id = None
+
+        if not appt.event_id:
+            # Crear de cero
+            try:
                 patient = db.query(models.Patient).filter(models.Patient.id == appt.patient_id).first()
                 pname = getattr(patient, "name", None) or "Paciente"
-                new_id = create_event(
+                new_event_id = create_event(
                     summary=f"Consulta — {pname}",
-                    start_local=appt.start_at,
-                    duration_min=duration,
+                    start_local=appt.start_at,  # naive local
+                    duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
                     location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
                     description=f"Canal: WhatsApp\nPaciente: {pname}"
                 )
-                appt.event_id = new_id
-                logger.info("GCAL create_event (reschedule) OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
-        except Exception as e:
-            logger.exception("GCAL reschedule falló appt_id=%s: %s", getattr(appt, "id", None), e)
+                appt.event_id = new_event_id
+                logger.info("Evento creado (reschedule) OK: event_id=%s appt_id=%s", new_event_id, getattr(appt, "id", None))
+            except Exception as e:
+                logger.exception("create_event falló durante reschedule (contact=%s): %s", contact, e)
 
         db.commit()
         return {"ok": True, "date_iso": date_iso, "time_hhmm": time_hhmm, "event_id": appt.event_id or None}
@@ -683,17 +674,15 @@ def run_agent(contact: str, user_text: str) -> str:
 
         # Normalizaciones menores de UX (evita separadores '|' y espacios repetidos)
         try:
-            final_text = re.sub(r"\s*\|\s*", " ", final_text)   # quita tuberías
-            final_text = re.sub(r"\s{2,}", " ", final_text).strip()  # espacios múltiples
-            final_text = re.sub(r"(·\s*){2,}", "· ", final_text)     # puntos medios repetidos
+            final_text = re.sub(r"\s*\|\s*", " ", final_text)
+            final_text = re.sub(r"\s{2,}", " ", final_text).strip()
+            final_text = re.sub(r"(·\s*){2,}", "· ", final_text)
         except Exception:
             pass
 
-        # Guarda para no repetir presentación en futuros saludos
         messages.append({"role": "assistant", "content": final_text})
         _save_mem(contact, messages, greeted=True)
         return final_text
 
-    # Si se exceden los hops de herramientas sin respuesta final
     _save_mem(contact, messages, greeted=True)
     return "Tuve un problema para cerrar la operación. ¿Desea que lo intente de nuevo o prefiere hablar con recepción?"
