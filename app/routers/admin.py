@@ -12,16 +12,24 @@ try:
 except Exception:
     _AGENT_SESSIONS = {}
 
+# BD
+from ..database import SessionLocal
+from .. import models
+
 # Herramientas de Calendar
 from ..services.scheduling import (
     _get_service,
     TIMEZONE,
     CALENDAR_ID,
     create_event,
+    delete_event,
 )
 
 router = APIRouter(tags=["admin"])
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth simple por header
+# ──────────────────────────────────────────────────────────────────────────────
 def _require_admin(x_admin_token: str | None) -> None:
     expected = (settings.ADMIN_TOKEN or "").strip()
     provided = (x_admin_token or "").strip()
@@ -30,8 +38,18 @@ def _require_admin(x_admin_token: str | None) -> None:
     if provided != expected:
         raise HTTPException(status_code=401, detail="Token inválido")
 
-# ====== Básicos ======
+# Helper de sesión DB
+def _db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Básicos
+# (recuerda: main.py monta este router con prefix="/admin")
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/ping")
 def admin_ping():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
@@ -58,13 +76,17 @@ def admin_clear_memory(x_admin_token: str | None = Header(default=None)):
         pass
     return {"ok": True, "message": "Memoria del agente limpiada."}
 
-# ====== Calendar: diagnóstico ======
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Calendar: diagnóstico
+# ──────────────────────────────────────────────────────────────────────────────
 @router.get("/calendar/list")
 def admin_calendar_list(
     x_admin_token: str | None = Header(default=None),
     limit: int = Query(default=10, ge=1, le=50),
 ):
+    """
+    Lista próximos eventos del calendario (singleEvents, orderBy=startTime).
+    """
     _require_admin(x_admin_token)
     svc = _get_service()
     time_min = datetime.utcnow().isoformat() + "Z"
@@ -92,6 +114,9 @@ def admin_calendar_freebusy(
     x_admin_token: str | None = Header(default=None),
     date_str: str = Query(alias="date", description="YYYY-MM-DD"),
 ):
+    """
+    Devuelve ventanas ocupadas de GCAL para la fecha dada (YYYY-MM-DD).
+    """
     _require_admin(x_admin_token)
     try:
         from datetime import time as _time
@@ -120,6 +145,9 @@ def admin_calendar_test_create(
     minutes_from_now: int = Query(default=2, ge=1, le=240),
     summary: str = Query(default="Ping de prueba"),
 ):
+    """
+    Crea un evento de prueba a N minutos desde ahora (en TZ local configurada).
+    """
     _require_admin(x_admin_token)
     import pytz
     tz = pytz.timezone(TIMEZONE)
@@ -141,3 +169,79 @@ def admin_calendar_test_create(
         "event_id": ev_id,
         "start_local": start_local.isoformat(),
     }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BD: utilidades de prueba (DÍA ESPECÍFICO)
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/db/appointments")
+def admin_db_appointments(
+    x_admin_token: str | None = Header(default=None),
+    date: str = Query(..., description="YYYY-MM-DD"),
+):
+    """
+    Lista las citas en BD para la fecha dada (horas guardadas en NAIVE LOCAL).
+    Útil para explicar por qué un slot sale ocupado aunque GCAL esté libre.
+    """
+    _require_admin(x_admin_token)
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD.")
+
+    start = datetime(d.year, d.month, d.day, 0, 0, 0)
+    end   = start + timedelta(days=1)
+
+    items = []
+    for db in _db():
+        q = (
+            db.query(models.Appointment, models.Patient)
+            .join(models.Patient, models.Patient.id == models.Appointment.patient_id)
+            .filter(models.Appointment.start_at >= start)
+            .filter(models.Appointment.start_at < end)
+            .order_by(models.Appointment.start_at.asc())
+        )
+        for ap, pa in q.all():
+            items.append({
+                "id": ap.id,
+                "patient": pa.name or pa.contact,
+                "start_at_naive_local": ap.start_at.isoformat() if ap.start_at else None,
+                "status": str(ap.status),
+                "event_id": ap.event_id,
+            })
+    return {"ok": True, "date": date, "count": len(items), "appointments": items}
+
+@router.post("/db/clear_day")
+def admin_db_clear_day(
+    x_admin_token: str | None = Header(default=None),
+    date: str = Query(..., description="YYYY-MM-DD"),
+):
+    """
+    ⚠️ SOLO para pruebas: borra todas las citas de BD de ese día y,
+    si tienen event_id, también borra el evento en Google Calendar.
+    """
+    _require_admin(x_admin_token)
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use YYYY-MM-DD.")
+
+    start = datetime(d.year, d.month, d.day, 0, 0, 0)
+    end   = start + timedelta(days=1)
+
+    deleted = []
+    for db in _db():
+        q = (
+            db.query(models.Appointment)
+            .filter(models.Appointment.start_at >= start)
+            .filter(models.Appointment.start_at < end)
+        )
+        for ap in q.all():
+            if ap.event_id:
+                try:
+                    delete_event(ap.event_id)
+                except Exception:
+                    pass
+            deleted.append(ap.id)
+            db.delete(ap)
+        db.commit()
+    return {"ok": True, "date": date, "deleted_ids": deleted}

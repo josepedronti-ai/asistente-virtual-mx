@@ -204,13 +204,12 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
     tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
     tz = ZoneInfo(tzname)
 
-    # Aware local para cálculo/registro…
+    # Aware local solo para cálculo; guardamos NAIVE LOCAL en BD
     start_dt_local_aware = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
-    # …y lo que guardamos en BD: NAIVE LOCAL (evita que el driver convierta a UTC y “pierda” el tz)
     start_dt_local_naive = start_dt_local_aware.replace(tzinfo=None)
 
     for db in db_session():
-        # validar slot (usa aware internamente/externamente, ok)
+        # validar slot contra GCAL + BD
         slots = available_slots(db, d, tzname) or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
@@ -221,25 +220,44 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
         patient.name = patient_name.strip().title()
         db.commit()
 
+        # crea o mueve en BD (SIEMPRE NAIVE LOCAL)
         appt = move_or_create_appointment(db, patient, start_dt_local_naive)
         appt.status = models.AppointmentStatus.confirmed
 
-        created_event_id = None
-        if not appt.event_id:
-            try:
-                logger.info("Creando evento en Calendar: contact=%s patient=%s start_local_naive=%s tz=%s",
+        duration = getattr(settings, "EVENT_DURATION_MIN", 30)
+
+        # 👉 SINCRONIZAR GCAL
+        try:
+            if appt.event_id:
+                # Si ya hay evento, intentar moverlo
+                try:
+                    logger.info("Intentando update_event en GCAL: event_id=%s -> %s %s (local)", appt.event_id, date_iso, time_hhmm)
+                    update_event(appt.event_id, start_dt_local_naive, duration_min=duration)
+                    logger.info("GCAL update_event OK: event_id=%s", appt.event_id)
+                except Exception as e_upd:
+                    logger.warning("GCAL update_event falló; recreando. appt_id=%s err=%s", getattr(appt, "id", None), e_upd)
+                    # Fallback: borra y crea
+                    try:
+                        delete_event(appt.event_id)
+                    except Exception as e_del:
+                        logger.warning("GCAL delete_event falló durante fallback: %s", e_del)
+                    appt.event_id = None
+
+            if not appt.event_id:
+                # Crear desde cero
+                logger.info("Creando evento en GCAL: contact=%s patient=%s start_local_naive=%s tz=%s",
                             contact, patient.name, appt.start_at.isoformat(), tzname)
-                created_event_id = create_event(
+                new_id = create_event(
                     summary=f"Consulta — {patient.name or 'Paciente'}",
-                    start_local=appt.start_at,  # NAIVE LOCAL — scheduling.create_event lo localiza correctamente
-                    duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
+                    start_local=appt.start_at,  # NAIVE LOCAL; scheduling.create_event localiza TZ
+                    duration_min=duration,
                     location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
-                    description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
+                    description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}",
                 )
-                appt.event_id = created_event_id
-                logger.info("Evento creado OK: event_id=%s (appt_id=%s)", created_event_id, getattr(appt, "id", None))
-            except Exception as e:
-                logger.exception("create_event falló contact=%s appt_id=%s: %s", contact, getattr(appt, "id", None), e)
+                appt.event_id = new_id
+                logger.info("GCAL create_event OK: event_id=%s appt_id=%s", new_id, getattr(appt, "id", None))
+        except Exception as e:
+            logger.exception("Sincronización GCAL falló (book): contact=%s appt_id=%s err=%s", contact, getattr(appt, "id", None), e)
 
         db.commit()
         logger.info("Cita confirmada en DB: appt_id=%s contact=%s start_at_naive_local=%s event_id=%s",
@@ -250,7 +268,7 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
             "patient_name": patient.name or "",
             "date_iso": date_iso,
             "time_hhmm": time_hhmm,
-            "event_id": appt.event_id or created_event_id or None
+            "event_id": appt.event_id or None
         }
 
 def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, client_request_id: str):
