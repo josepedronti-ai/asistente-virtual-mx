@@ -1,7 +1,8 @@
 # app/routers/admin.py
 from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException, Query
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
+from typing import Optional
 
 from ..config import settings
 
@@ -11,10 +12,12 @@ try:
 except Exception:
     _AGENT_SESSIONS = {}
 
-# Scheduling helpers
+# Herramientas de Calendar que ya tienes implementadas
 from ..services.scheduling import (
-    CALENDAR_ID, TIMEZONE, list_upcoming_events, freebusy_for_date,
-    _get_service, create_event, delete_event
+    _get_service,   # cliente Google Calendar (usa service account + impersonation)
+    TIMEZONE,
+    CALENDAR_ID,
+    create_event,
 )
 
 router = APIRouter(tags=["admin"])
@@ -27,23 +30,25 @@ def _require_admin(x_admin_token: str | None) -> None:
     if provided != expected:
         raise HTTPException(status_code=401, detail="Token inválido")
 
-@router.get("/admin/ping")
+# ====== Básicos ======
+
+@router.get("/ping")
 def admin_ping():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-@router.get("/admin/health")
+@router.get("/health")
 def admin_health():
     return {
         "ok": True,
         "app": settings.APP_NAME,
         "env": settings.ENV,
         "tz": settings.TIMEZONE,
-        "calendarId": CALENDAR_ID,
+        "calendar_id": CALENDAR_ID,
         "agent_sessions": len(_AGENT_SESSIONS) if isinstance(_AGENT_SESSIONS, dict) else "n/a",
         "ts": datetime.utcnow().isoformat(),
     }
 
-@router.post("/admin/mem/clear")
+@router.post("/mem/clear")
 def admin_clear_memory(x_admin_token: str | None = Header(default=None)):
     _require_admin(x_admin_token)
     try:
@@ -53,46 +58,101 @@ def admin_clear_memory(x_admin_token: str | None = Header(default=None)):
         pass
     return {"ok": True, "message": "Memoria del agente limpiada."}
 
-# ====== Calendar Diagnostics ======
+# ====== Calendar: diagnóstico ======
 
-@router.get("/admin/calendar/list")
-def admin_calendar_list(x_admin_token: str | None = Header(default=None), limit: int = Query(10, ge=1, le=50)):
+@router.get("/calendar/list")
+def admin_calendar_list(
+    x_admin_token: str | None = Header(default=None),
+    limit: int = Query(default=10, ge=1, le=50),
+):
+    """
+    Lista próximos eventos del calendario (singleEvents, orderBy=startTime).
+    """
     _require_admin(x_admin_token)
-    events = list_upcoming_events(limit=limit)
-    return {"ok": True, "calendarId": CALENDAR_ID, "events": events}
+    svc = _get_service()
+    time_min = datetime.utcnow().isoformat() + "Z"
+    resp = svc.events().list(
+        calendarId=CALENDAR_ID,
+        timeMin=time_min,
+        maxResults=limit,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
 
-@router.get("/admin/calendar/freebusy")
+    items = resp.get("items", [])
+    out = [{
+        "id": ev.get("id"),
+        "summary": ev.get("summary"),
+        "start": ev.get("start"),
+        "end": ev.get("end"),
+        "htmlLink": ev.get("htmlLink"),
+    } for ev in items]
+
+    return {"ok": True, "calendar_id": CALENDAR_ID, "tz": TIMEZONE, "events": out}
+
+@router.get("/calendar/freebusy")
 def admin_calendar_freebusy(
     x_admin_token: str | None = Header(default=None),
-    date_str: str = Query(..., description="YYYY-MM-DD")
+    date_str: str = Query(alias="date", description="YYYY-MM-DD"),
 ):
+    """
+    Devuelve ventanas ocupadas de GCAL para la fecha dada (YYYY-MM-DD).
+    """
     _require_admin(x_admin_token)
     try:
+        from datetime import date as _date, time as _time
+        import pytz
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Formato de fecha inválido. Usa YYYY-MM-DD.")
-    busy = freebusy_for_date(d)
-    return {"ok": True, "calendarId": CALENDAR_ID, "date": d.isoformat(), "busy": busy}
+        tz = pytz.timezone(TIMEZONE)
+        day_start = tz.localize(datetime.combine(d, _time(0, 0)))
+        day_end = day_start + timedelta(days=1)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Parámetro 'date' inválido. Use YYYY-MM-DD.")
 
-@router.post("/admin/calendar/test-create")
+    svc = _get_service()
+    body = {
+        "timeMin": day_start.isoformat(),
+        "timeMax": day_end.isoformat(),
+        "timeZone": TIMEZONE,
+        "items": [{"id": CALENDAR_ID}],
+    }
+    resp = svc.freebusy().query(body=body).execute()
+    busy = resp.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
+    return {
+        "ok": True,
+        "calendar_id": CALENDAR_ID,
+        "tz": TIMEZONE,
+        "date": date_str,
+        "busy": busy,
+    }
+
+@router.post("/calendar/test-create")
 def admin_calendar_test_create(
     x_admin_token: str | None = Header(default=None),
-    summary: str = Query("Prueba rápida CLIEMED"),
-    minutes_from_now: int = Query(5, ge=0, le=120)
+    minutes_from_now: int = Query(default=2, ge=1, le=240),
+    summary: str = Query(default="Ping de prueba"),
 ):
     """
-    Crea un evento de prueba de 5 minutos a partir de ahora + offset.
-    Lo borra inmediatamente después de crearlo (para probar permisos/impersonación).
+    Crea un evento de prueba a N minutos desde ahora (en TZ local configurada).
     """
     _require_admin(x_admin_token)
-    tz = TIMEZONE
-    now_local = datetime.now().astimezone()
+    import pytz
+    tz = pytz.timezone(TIMEZONE)
+    now_local = datetime.now(tz)
     start_local = now_local + timedelta(minutes=minutes_from_now)
     start_local = start_local.replace(second=0, microsecond=0)
-    try:
-        eid = create_event(summary=summary, start_local=start_local, duration_min=5, location="", description="[test]")
-        # Lo eliminamos para dejar limpio el calendario
-        delete_event(eid)
-        return {"ok": True, "did_create_and_delete": True, "event_id": eid, "start_local": start_local.isoformat(), "tz": tz}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fallo al crear/borrar evento de prueba: {e}")
+
+    ev_id = create_event(
+        summary=summary,
+        start_local=start_local,
+        duration_min=30,
+        location="(prueba)",
+        description="Evento de prueba creado desde /admin/calendar/test-create",
+    )
+    return {
+        "ok": True,
+        "calendar_id": CALENDAR_ID,
+        "tz": TIMEZONE,
+        "event_id": ev_id,
+        "start_local": start_local.isoformat(),
+    }
