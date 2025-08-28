@@ -10,7 +10,7 @@ from openai import OpenAI
 from ..config import settings
 from ..database import SessionLocal
 from .. import models
-from ..services.scheduling import available_slots, create_event, delete_event
+from ..services.scheduling import available_slots, create_event, update_event, delete_event
 from ..replygen.core import generate_reply
 
 try:
@@ -217,21 +217,36 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
         appt = move_or_create_appointment(db, patient, start_dt)
         appt.status = models.AppointmentStatus.confirmed
 
-        created_event_id = None
-        if not appt.event_id:
-            try:
-                logger.info("Creando evento en Calendar: contact=%s patient=%s start_local=%s tz=%s", contact, patient.name, appt.start_at.isoformat(), tzname)
-                created_event_id = create_event(
+        # --- Sincronizar con Google Calendar (update-or-create) ---
+        duration = getattr(settings, "EVENT_DURATION_MIN", 30)
+        try:
+            if appt.event_id:
+                try:
+                    update_event(appt.event_id, appt.start_at, duration_min=duration)
+                    logger.info("GCAL update_event OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
+                except Exception as e_upd:
+                    logger.warning("GCAL update_event falló; creando nuevo. appt_id=%s err=%s", getattr(appt, "id", None), e_upd)
+                    new_id = create_event(
+                        summary=f"Consulta — {patient.name or 'Paciente'}",
+                        start_local=appt.start_at,
+                        duration_min=duration,
+                        location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
+                        description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
+                    )
+                    appt.event_id = new_id
+                    logger.info("GCAL create_event por fallback OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
+            else:
+                new_id = create_event(
                     summary=f"Consulta — {patient.name or 'Paciente'}",
-                    start_local=appt.start_at,  # aware con tz local
-                    duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
+                    start_local=appt.start_at,
+                    duration_min=duration,
                     location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
                     description=f"Canal: WhatsApp\nPaciente: {patient.name or patient.contact}"
                 )
-                appt.event_id = created_event_id
-                logger.info("Evento creado OK: event_id=%s (appt_id=%s)", created_event_id, getattr(appt, "id", None))
-            except Exception as e:
-                logger.exception("create_event falló contact=%s appt_id=%s: %s", contact, getattr(appt, "id", None), e)
+                appt.event_id = new_id
+                logger.info("GCAL create_event OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
+        except Exception as e:
+            logger.exception("Sincronización GCAL falló appt_id=%s: %s", getattr(appt, "id", None), e)
 
         db.commit()
         logger.info("Cita confirmada en DB: appt_id=%s contact=%s start_at=%s event_id=%s", getattr(appt, "id", None), contact, appt.start_at.isoformat(), appt.event_id)
@@ -241,7 +256,7 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
             "patient_name": patient.name or "",
             "date_iso": date_iso,
             "time_hhmm": time_hhmm,
-            "event_id": appt.event_id or created_event_id or None
+            "event_id": appt.event_id or None
         }
 
 def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, client_request_id: str):
@@ -266,35 +281,45 @@ def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, cli
         # Actualiza fecha/hora en DB
         appt.start_at = start_dt
 
-        # Sin update_event, reflejamos en Calendar borrando y recreando
+        # --- Update-or-create en Calendar ---
+        duration = getattr(settings, "EVENT_DURATION_MIN", 30)
         try:
             if appt.event_id:
-                logger.info("Eliminando evento previo para reagendar: event_id=%s", appt.event_id)
-                delete_event(appt.event_id)
-                appt.event_id = None
+                try:
+                    update_event(appt.event_id, appt.start_at, duration_min=duration)
+                    logger.info("GCAL update_event OK (reschedule): appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
+                except Exception as e_upd:
+                    logger.warning("GCAL update_event falló en reschedule; creando nuevo. appt_id=%s err=%s", getattr(appt, "id", None), e_upd)
+                    # reconstruye summary con nombre actual
+                    patient = db.query(models.Patient).filter(models.Patient.id == appt.patient_id).first()
+                    pname = getattr(patient, "name", None) or "Paciente"
+                    new_id = create_event(
+                        summary=f"Consulta — {pname}",
+                        start_local=appt.start_at,
+                        duration_min=duration,
+                        location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
+                        description=f"Canal: WhatsApp\nPaciente: {pname}"
+                    )
+                    appt.event_id = new_id
+                    logger.info("GCAL create_event (reschedule fallback) OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
+            else:
+                # no había event_id, crear
+                patient = db.query(models.Patient).filter(models.Patient.id == appt.patient_id).first()
+                pname = getattr(patient, "name", None) or "Paciente"
+                new_id = create_event(
+                    summary=f"Consulta — {pname}",
+                    start_local=appt.start_at,
+                    duration_min=duration,
+                    location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
+                    description=f"Canal: WhatsApp\nPaciente: {pname}"
+                )
+                appt.event_id = new_id
+                logger.info("GCAL create_event (reschedule) OK: appt_id=%s event_id=%s", getattr(appt, "id", None), appt.event_id)
         except Exception as e:
-            logger.exception("delete_event falló durante reschedule (contact=%s): %s", contact, e)
-
-        new_event_id = None
-        try:
-            logger.info("Creando evento (reschedule) contact=%s start_local=%s tz=%s", contact, appt.start_at.isoformat(), tzname)
-            # Busca nombre paciente para el summary
-            patient = db.query(models.Patient).filter(models.Patient.id == appt.patient_id).first()
-            pname = getattr(patient, "name", None) or "Paciente"
-            new_event_id = create_event(
-                summary=f"Consulta — {pname}",
-                start_local=appt.start_at,
-                duration_min=getattr(settings, "EVENT_DURATION_MIN", 30),
-                location="CLIEMED, Av. Prof. Moisés Sáenz 1500, Monterrey, N.L.",
-                description=f"Canal: WhatsApp\nPaciente: {pname}"
-            )
-            appt.event_id = new_event_id
-            logger.info("Evento creado (reschedule) OK: event_id=%s appt_id=%s", new_event_id, getattr(appt, "id", None))
-        except Exception as e:
-            logger.exception("create_event falló durante reschedule (contact=%s): %s", contact, e)
+            logger.exception("GCAL reschedule falló appt_id=%s: %s", getattr(appt, "id", None), e)
 
         db.commit()
-        return {"ok": True, "date_iso": date_iso, "time_hhmm": time_hhmm, "event_id": appt.event_id or new_event_id or None}
+        return {"ok": True, "date_iso": date_iso, "time_hhmm": time_hhmm, "event_id": appt.event_id or None}
 
 def tool_cancel_appointment(contact: str):
     for db in db_session():
@@ -658,12 +683,9 @@ def run_agent(contact: str, user_text: str) -> str:
 
         # Normalizaciones menores de UX (evita separadores '|' y espacios repetidos)
         try:
-            # Quita tuberías y espacios alrededor
-            final_text = re.sub(r"\s*\|\s*", " ", final_text)
-            # Compacta espacios múltiples
-            final_text = re.sub(r"\s{2,}", " ", final_text).strip()
-            # Limpia puntos medios repetidos (por si el modelo produce '·  ·')
-            final_text = re.sub(r"(·\s*){2,}", "· ", final_text)
+            final_text = re.sub(r"\s*\|\s*", " ", final_text)   # quita tuberías
+            final_text = re.sub(r"\s{2,}", " ", final_text).strip()  # espacios múltiples
+            final_text = re.sub(r"(·\s*){2,}", "· ", final_text)     # puntos medios repetidos
         except Exception:
             pass
 

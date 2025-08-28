@@ -12,15 +12,15 @@ try:
 except Exception:
     _AGENT_SESSIONS = {}
 
-# Herramientas de Calendar que ya tienes implementadas
+# Herramientas de Calendar
 from ..services.scheduling import (
-    _get_service,   # cliente Google Calendar (usa service account + impersonation)
+    _get_service,
     TIMEZONE,
     CALENDAR_ID,
     create_event,
 )
 
-router = APIRouter(tags=["admin"])
+router = APIRouter(tags=["admin"], prefix="/admin")
 
 def _require_admin(x_admin_token: str | None) -> None:
     expected = (settings.ADMIN_TOKEN or "").strip()
@@ -65,9 +65,6 @@ def admin_calendar_list(
     x_admin_token: str | None = Header(default=None),
     limit: int = Query(default=10, ge=1, le=50),
 ):
-    """
-    Lista próximos eventos del calendario (singleEvents, orderBy=startTime).
-    """
     _require_admin(x_admin_token)
     svc = _get_service()
     time_min = datetime.utcnow().isoformat() + "Z"
@@ -95,12 +92,9 @@ def admin_calendar_freebusy(
     x_admin_token: str | None = Header(default=None),
     date_str: str = Query(alias="date", description="YYYY-MM-DD"),
 ):
-    """
-    Devuelve ventanas ocupadas de GCAL para la fecha dada (YYYY-MM-DD).
-    """
     _require_admin(x_admin_token)
     try:
-        from datetime import date as _date, time as _time
+        from datetime import time as _time
         import pytz
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
         tz = pytz.timezone(TIMEZONE)
@@ -118,13 +112,7 @@ def admin_calendar_freebusy(
     }
     resp = svc.freebusy().query(body=body).execute()
     busy = resp.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
-    return {
-        "ok": True,
-        "calendar_id": CALENDAR_ID,
-        "tz": TIMEZONE,
-        "date": date_str,
-        "busy": busy,
-    }
+    return {"ok": True, "calendar_id": CALENDAR_ID, "tz": TIMEZONE, "date": date_str, "busy": busy}
 
 @router.post("/calendar/test-create")
 def admin_calendar_test_create(
@@ -132,9 +120,6 @@ def admin_calendar_test_create(
     minutes_from_now: int = Query(default=2, ge=1, le=240),
     summary: str = Query(default="Ping de prueba"),
 ):
-    """
-    Crea un evento de prueba a N minutos desde ahora (en TZ local configurada).
-    """
     _require_admin(x_admin_token)
     import pytz
     tz = pytz.timezone(TIMEZONE)
