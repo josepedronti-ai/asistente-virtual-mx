@@ -1,7 +1,7 @@
 # app/agent/agent_controller.py
 from __future__ import annotations
 import os, json, re, unicodedata, uuid
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 
@@ -85,7 +85,7 @@ def find_latest_active_for_contact(db, contact: str):
 
 def move_or_create_appointment(db, patient: models.Patient, start_dt_naive_local: datetime) -> models.Appointment:
     """
-    start_dt_naive_local: datetime SIN tzinfo (hora local de Monterrey/CDMX).
+    start_dt_naive_local: datetime SIN tzinfo (hora local de TIMEZONE).
     """
     appt = (
         db.query(models.Appointment)
@@ -204,16 +204,17 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
     tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
     tz = ZoneInfo(tzname)
 
-    # Aware local solo para cálculo; guardamos NAIVE LOCAL en BD
+    # Aware local (para cálculo) -> NAIVE local para BD
     start_dt_local_aware = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
     start_dt_local_naive = start_dt_local_aware.replace(tzinfo=None)
 
     for db in db_session():
-        # validar slot contra GCAL + BD
+        # Validar slot contra GCAL + BD
         slots = available_slots(db, d, tzname) or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
-            logger.info("Slot no disponible: %s %s (contact=%s) alternatives=%s", date_iso, time_hhmm, contact, [s.strftime("%H:%M") for s in slots])
+            logger.info("Slot no disponible: %s %s (contact=%s) alternatives=%s",
+                        date_iso, time_hhmm, contact, [s.strftime("%H:%M") for s in slots])
             return {"ok": False, "reason": "slot_unavailable", "alternatives": [s.strftime("%H:%M") for s in slots]}
 
         patient = get_or_create_patient(db, contact)
@@ -223,20 +224,20 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
         # crea o mueve en BD (SIEMPRE NAIVE LOCAL)
         appt = move_or_create_appointment(db, patient, start_dt_local_naive)
         appt.status = models.AppointmentStatus.confirmed
-
         duration = getattr(settings, "EVENT_DURATION_MIN", 30)
 
         # 👉 SINCRONIZAR GCAL
         try:
             if appt.event_id:
-                # Si ya hay evento, intentar moverlo
+                # Intentar mover primero
                 try:
-                    logger.info("Intentando update_event en GCAL: event_id=%s -> %s %s (local)", appt.event_id, date_iso, time_hhmm)
+                    logger.info("Intentando update_event en GCAL: event_id=%s -> %s %s (local)",
+                                appt.event_id, date_iso, time_hhmm)
                     update_event(appt.event_id, start_dt_local_naive, duration_min=duration)
                     logger.info("GCAL update_event OK: event_id=%s", appt.event_id)
                 except Exception as e_upd:
-                    logger.warning("GCAL update_event falló; recreando. appt_id=%s err=%s", getattr(appt, "id", None), e_upd)
-                    # Fallback: borra y crea
+                    logger.warning("GCAL update_event falló; recreando. appt_id=%s err=%s",
+                                   getattr(appt, "id", None), e_upd)
                     try:
                         delete_event(appt.event_id)
                     except Exception as e_del:
@@ -257,7 +258,8 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
                 appt.event_id = new_id
                 logger.info("GCAL create_event OK: event_id=%s appt_id=%s", new_id, getattr(appt, "id", None))
         except Exception as e:
-            logger.exception("Sincronización GCAL falló (book): contact=%s appt_id=%s err=%s", contact, getattr(appt, "id", None), e)
+            logger.exception("Sincronización GCAL falló (book): contact=%s appt_id=%s err=%s",
+                             contact, getattr(appt, "id", None), e)
 
         db.commit()
         logger.info("Cita confirmada en DB: appt_id=%s contact=%s start_at_naive_local=%s event_id=%s",
@@ -295,16 +297,22 @@ def tool_reschedule_appointment(contact: str, date_iso: str, time_hhmm: str, cli
         # Actualiza fecha/hora en DB (naive local)
         appt.start_at = start_dt_local_naive
 
-        # Intento de update; si falla (403), borramos y recreamos
+        # Intento de update; si falla (403), borrar y recrear
         try:
             if appt.event_id:
                 try:
-                    logger.info("Intentando update_event GCAL: event_id=%s → %s %s (local)", appt.event_id, date_iso, time_hhmm)
-                    update_event(appt.event_id, start_dt_local_naive, duration_min=getattr(settings, "EVENT_DURATION_MIN", 30))
+                    logger.info("Intentando update_event GCAL: event_id=%s → %s %s (local)",
+                                appt.event_id, date_iso, time_hhmm)
+                    update_event(appt.event_id, start_dt_local_naive,
+                                 duration_min=getattr(settings, "EVENT_DURATION_MIN", 30))
                     logger.info("GCAL update_event OK: event_id=%s", appt.event_id)
                 except Exception as e_upd:
-                    logger.warning("GCAL update_event falló; creando nuevo. appt_id=%s err=%s", getattr(appt,"id",None), e_upd)
-                    delete_event(appt.event_id)
+                    logger.warning("GCAL update_event falló; creando nuevo. appt_id=%s err=%s",
+                                   getattr(appt,"id",None), e_upd)
+                    try:
+                        delete_event(appt.event_id)
+                    except Exception as e_del:
+                        logger.warning("GCAL delete_event falló durante fallback reschedule: %s", e_del)
                     appt.event_id = None
         except Exception as e:
             logger.exception("Fallo durante reschedule (delete/update): %s", e)
@@ -622,7 +630,8 @@ def run_agent(contact: str, user_text: str) -> str:
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
     # Pre-normaliza fecha relativa del lado servidor (sin tool_calls)
-    today_iso = datetime.utcnow().date().isoformat()
+    # ⚠️ Usa hora local, no UTC, para que “mañana” sea consistente.
+    today_iso = _now_local().date().isoformat()
     date_hint = _server_normalize_date_hint(user_text, today_iso)
     user_payload = user_text
     if date_hint:
@@ -690,11 +699,11 @@ def run_agent(contact: str, user_text: str) -> str:
         if not final_text:
             final_text = "Por ahora no pude completar la acción. ¿Desea que intentemos nuevamente o prefiere hablar con recepción?"
 
-        # Normalizaciones menores de UX (evita separadores '|' y espacios repetidos)
+        # Normalizaciones menores de UX
         try:
-            final_text = re.sub(r"\s*\|\s*", " ", final_text)
-            final_text = re.sub(r"\s{2,}", " ", final_text).strip()
-            final_text = re.sub(r"(·\s*){2,}", "· ", final_text)
+            final_text = re.sub(r"\s*\|\s*", " ", final_text)          # quita tuberías
+            final_text = re.sub(r"\s{2,}", " ", final_text).strip()    # compacta espacios
+            final_text = re.sub(r"(·\s*){2,}", "· ", final_text)       # limpia puntos medios repetidos
         except Exception:
             pass
 
