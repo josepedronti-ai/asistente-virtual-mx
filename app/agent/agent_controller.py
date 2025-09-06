@@ -687,7 +687,7 @@ def run_agent(contact: str, user_text: str) -> str:
                         if norm:
                             args["time_hhmm"] = norm
 
-                    # Fuerza el último HINT_FECHA si lo tenemos:
+                    # ▶ Fuerza SIEMPRE el último HINT_FECHA si existe
                     if _LAST_DATE_HINT.get(contact):
                         args["date_iso"] = _LAST_DATE_HINT[contact]
 
