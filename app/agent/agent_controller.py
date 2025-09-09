@@ -571,30 +571,67 @@ def _build_greeting() -> str:
 
 def _server_normalize_date_hint(text: str, today_iso: str | None = None) -> str | None:
     """
-    Resuelve términos relativos tipo “hoy/mañana/próximo lunes…” a YYYY-MM-DD usando dateparser.
-    No hace tool_calls; retorna solo la fecha si se detecta y puede resolverse.
+    Resuelve fechas relativas y absolutas SIN año a YYYY-MM-DD (preferir futuro),
+    para inyectar [HINT_FECHA:...] y evitar que el modelo 'viaje en el tiempo'.
     """
     if not dp_parse:
         return None
-    t = _norm(text)
-    patrones_relativos = [
-        "hoy", "mañana", "manana", "el dia de manana", "el día de mañana", "para mañana", "para manana",
-        "pasado mañana", "pasado manana",
-        "próximo", "proximo", "próxima", "proxima",
-        "esta semana", "la siguiente semana", "siguiente semana",
-        "este", "siguiente",
-        "el lunes", "el martes", "el miercoles", "el miércoles", "el jueves",
-        "el viernes", "el sabado", "el sábado", "el domingo"
-    ]
-    if not any(p in t for p in patrones_relativos):
-        return None
+
+    t_raw = text or ""
+    t = _norm(t_raw)
     base = datetime.strptime(today_iso, "%Y-%m-%d") if today_iso else datetime.utcnow()
+
+    # 1) ¿Contiene términos relativos? -> usar dateparser con preferencia a futuro
+    relativos = [
+        "hoy","mañana","manana","el dia de manana","el día de mañana","para mañana","para manana",
+        "pasado mañana","pasado manana","próximo","proximo","próxima","proxima",
+        "esta semana","la siguiente semana","siguiente semana","este","siguiente",
+        "el lunes","el martes","el miercoles","el miércoles","el jueves","el viernes","el sabado","el sábado","el domingo"
+    ]
+    has_rel = any(p in t for p in relativos)
+
+    # 2) ¿Contiene fecha 'absoluta' sin año? (30/09, 30-09, 30 de septiembre)
+    import re
+    month_names = ("enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","setiembre","octubre","noviembre","diciembre")
+    abs_sin_ano = False
+    # dd[/.-]mm (sin año)
+    if re.search(r"\b([0-3]?\d)[/\.-]([01]?\d)\b(?![/\.-]\d{2,4})", t):
+        abs_sin_ano = True
+    # "dd de <mes>" sin año
+    if re.search(rf"\b([0-3]?\d)\s+de\s+({'|'.join(month_names)})\b(?!\s+de\s+\d{{2,4}})", t):
+        abs_sin_ano = True
+
+    # 3) Si hay año explícito, dejamos que el modelo decida; no metemos hint.
+    has_year = re.search(r"\b(20\d{2}|19\d{2})\b", t) is not None
+
+    if not has_rel and not abs_sin_ano:
+        return None
+
+    # Parse con preferencia al futuro
     dt = dp_parse(
-        text,
+        t_raw,
         languages=["es"],
         settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": base, "DATE_ORDER": "DMY"},
     )
-    return dt.date().isoformat() if dt else None
+
+    if not dt:
+        return None
+
+    # 4) Si NO había año explícito y el resultado quedó en pasado (>30 días),
+    #    súbelo al futuro (mismo día/mes del año actual o siguiente).
+    if not has_year:
+        today = base.date()
+        d = dt.date()
+        if d < today:
+            # intenta mismo día/mes en el año actual; si sigue en pasado, usa siguiente año
+            try_this_year = date(today.year, d.month, d.day)
+            if try_this_year >= today:
+                d = try_this_year
+            else:
+                d = date(today.year + 1, d.month, d.day)
+            dt = datetime(d.year, d.month, d.day)
+
+    return dt.date().isoformat()
 
 # -----------------------
 # Loop del Agente
