@@ -237,8 +237,37 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
         slots = available_slots(db, d, tzname) or []
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
-            logger.info("Slot no disponible: %s %s (contact=%s) alternatives=%s", date_iso, time_hhmm, contact, [s.strftime("%H:%M") for s in slots])
-            return {"ok": False, "reason": "slot_unavailable", "alternatives": [s.strftime("%H:%M") for s in slots]}
+            # ⚠️ Fallback: si la hora pedida cae en la grilla clínica (apertura/cierre y múltiplos),
+            # permitimos continuar y que GCal valide conflictos reales.
+            try:
+                from ..services import scheduling as _sched
+                open_h = getattr(_sched, "CLINIC_OPEN_HOUR", 16)
+                close_h = getattr(_sched, "CLINIC_CLOSE_HOUR", 22)
+                step_min = getattr(_sched, "SLOT_MINUTES", 30)
+            except Exception:
+                open_h, close_h, step_min = 16, 22, 30
+
+            in_business_hours = (
+                (h > open_h or (h == open_h and m >= 0)) and
+                (h < close_h or (h == close_h and m == 0))
+            )
+            is_on_grid = (m % step_min == 0)
+
+            if not (in_business_hours and is_on_grid):
+                logger.info(
+                    "Slot fuera de grilla/horario: %s %s (contact=%s) alternatives=%s",
+                    date_iso, time_hhmm, contact, [s.strftime("%H:%M") for s in slots]
+                )
+                return {
+                    "ok": False,
+                    "reason": "slot_unavailable",
+                    "alternatives": [s.strftime("%H:%M") for s in slots]
+                }
+
+            logger.warning(
+                "Fallback de grilla activado: proceeding con %s %s aunque no esté en available_slots().",
+                date_iso, time_hhmm
+            )
 
         patient = get_or_create_patient(db, contact)
         patient.name = patient_name.strip().title()
