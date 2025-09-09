@@ -28,6 +28,7 @@ TTL_MIN = 20
 
 # 🔹 Memoria auxiliar: último HINT_FECHA resuelto por contacto
 _LAST_DATE_HINT: dict[str, str] = {}
+_LAST_SLOTS_DATE: dict[str, str] = {}
 
 def _now():
     return datetime.utcnow()
