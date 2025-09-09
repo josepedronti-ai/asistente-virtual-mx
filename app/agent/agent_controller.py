@@ -192,10 +192,30 @@ def hhmm_from_text_or_none(text: str) -> str | None:
 # Herramientas (llamadas por el Agente)
 # -----------------------
 def tool_check_slots(contact: str, date_iso: str):
-    d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
+    today_local = datetime.now(ZoneInfo(tzname)).date()
+
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    except Exception:
+        d = today_local
+
+    # 🔒 Clamp de seguridad: si la fecha está >30 días en el pasado, mueve dd/mm a futuro
+    if d < (today_local - timedelta(days=30)):
+        try:
+            d_this_year = date(today_local.year, d.month, d.day)
+            if d_this_year >= today_local:
+                d = d_this_year
+            else:
+                d = date(today_local.year + 1, d.month, d.day)
+        except Exception:
+            d = today_local
+
     for db in db_session():
-        slots = available_slots(db, d, getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey") or []
-        return {"date_iso": date_iso, "slots": [s.strftime("%H:%M") for s in slots]}
+        slots = available_slots(db, d, tzname) or []
+        # guarda la fecha normalizada para posteriores tool-calls
+        _LAST_SLOTS_DATE[contact] = d.isoformat()
+        return {"date_iso": d.isoformat(), "slots": [s.strftime("%H:%M") for s in slots]}
 
 def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_name: str, channel: str, client_request_id: str):
     # Validación básica
@@ -581,16 +601,18 @@ def _server_normalize_date_hint(text: str, today_iso: str | None = None) -> str 
     t = _norm(t_raw)
     base = datetime.strptime(today_iso, "%Y-%m-%d") if today_iso else datetime.utcnow()
 
-    # 1) ¿Contiene términos relativos? -> usar dateparser con preferencia a futuro
+    # 1) ¿Hay términos relativos?
     relativos = [
         "hoy","mañana","manana","el dia de manana","el día de mañana","para mañana","para manana",
-        "pasado mañana","pasado manana","próximo","proximo","próxima","proxima",
-        "esta semana","la siguiente semana","siguiente semana","este","siguiente",
+        "pasado mañana","pasado manana",
+        "próximo","proximo","próxima","proxima",
+        "esta semana","la siguiente semana","siguiente semana",
+        "este","siguiente",
         "el lunes","el martes","el miercoles","el miércoles","el jueves","el viernes","el sabado","el sábado","el domingo"
     ]
     has_rel = any(p in t for p in relativos)
 
-    # 2) ¿Contiene fecha 'absoluta' sin año? (30/09, 30-09, 30 de septiembre)
+    # 2) ¿Hay fecha absoluta SIN año? (30/09, 30-09, 30 de septiembre)
     import re
     month_names = ("enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","setiembre","octubre","noviembre","diciembre")
     abs_sin_ano = False
@@ -601,29 +623,25 @@ def _server_normalize_date_hint(text: str, today_iso: str | None = None) -> str 
     if re.search(rf"\b([0-3]?\d)\s+de\s+({'|'.join(month_names)})\b(?!\s+de\s+\d{{2,4}})", t):
         abs_sin_ano = True
 
-    # 3) Si hay año explícito, dejamos que el modelo decida; no metemos hint.
+    # 3) ¿Hay año explícito?
     has_year = re.search(r"\b(20\d{2}|19\d{2})\b", t) is not None
 
     if not has_rel and not abs_sin_ano:
         return None
 
-    # Parse con preferencia al futuro
     dt = dp_parse(
         t_raw,
         languages=["es"],
         settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": base, "DATE_ORDER": "DMY"},
     )
-
     if not dt:
         return None
 
-    # 4) Si NO había año explícito y el resultado quedó en pasado (>30 días),
-    #    súbelo al futuro (mismo día/mes del año actual o siguiente).
+    # 4) Si NO había año explícito y quedó en pasado, súbelo al futuro (mismo dd/mm este año o el siguiente)
     if not has_year:
         today = base.date()
         d = dt.date()
         if d < today:
-            # intenta mismo día/mes en el año actual; si sigue en pasado, usa siguiente año
             try_this_year = date(today.year, d.month, d.day)
             if try_this_year >= today:
                 d = try_this_year
@@ -681,8 +699,8 @@ def run_agent(contact: str, user_text: str) -> str:
     date_hint = _server_normalize_date_hint(user_text, today_iso)
     user_payload = user_text
     if date_hint:
+        logger.info("HINT_FECHA detectado: %s (payload con hint)", date_hint)
         user_payload = f"{user_text}\n\n[HINT_FECHA:{date_hint}]"
-        # 🔹 guarda el hint para forzarlo en tool-calls
         _LAST_DATE_HINT[contact] = date_hint
 
     # Nuevo mensaje del usuario (posible payload con HINT_FECHA)
