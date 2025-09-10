@@ -208,7 +208,6 @@ def tool_check_slots(contact: str, date_iso: str):
         try:
             d = d.replace(year=today_local.year)
         except ValueError:
-            # p.ej. 29/02 en año no bisiesto → usa hoy
             d = today_local
     if d < today_local:
         try:
@@ -218,27 +217,12 @@ def tool_check_slots(contact: str, date_iso: str):
 
     for db in db_session():
         slots = available_slots(db, d, tzname) or []
-        # guarda la fecha ya saneada para posteriores tool-calls
         _LAST_SLOTS_DATE[contact] = d.isoformat()
-        return {"date_iso": d.isoformat(), "slots": [s.strftime("%H:%M") for s in slots]}
-
-    # Si viene con año anterior, súbelo al año actual; si aún queda en pasado, súbelo un año más
-    if d.year < today_local.year:
+        # logging extra
         try:
-            d = d.replace(year=today_local.year)
-        except ValueError:
-            # p.ej. 29/02 en año no bisiesto → usa hoy
-            d = today_local
-    if d < today_local:
-        try:
-            d = d.replace(year=d.year + 1)
-        except ValueError:
-            d = today_local
-
-    for db in db_session():
-        slots = available_slots(db, d, tzname) or []
-        # guarda la fecha ya saneada para posteriores tool-calls
-        _LAST_SLOTS_DATE[contact] = d.isoformat()
+            logger.info("check_slots %s -> %s", d.isoformat(), [s.strftime("%H:%M") for s in slots])
+        except Exception:
+            pass
         return {"date_iso": d.isoformat(), "slots": [s.strftime("%H:%M") for s in slots]}
 
 def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_name: str, channel: str, client_request_id: str):
@@ -258,6 +242,10 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
     for db in db_session():
         # validar slot contra GCAL + BD
         slots = available_slots(db, d, tzname) or []
+        try:
+            logger.info("book_appointment %s %s -> slots:%s", date_iso, time_hhmm, [s.strftime("%H:%M") for s in slots])
+        except Exception:
+            pass
         allowed = any(s.hour == h and s.minute == m for s in slots)
         if not allowed:
             # ⚠️ Fallback: si la hora pedida cae en la grilla clínica (apertura/cierre y múltiplos),
@@ -304,23 +292,37 @@ def tool_book_appointment(contact: str, date_iso: str, time_hhmm: str, patient_n
 
         # 👉 SINCRONIZAR GCAL
         try:
-            if appt.event_id:
-                # Si ya hay evento, intentar moverlo
+            # ¿El evento previo es de otro año? → recrear limpio
+            recreate = False
+            if getattr(appt, "event_id", None):
+                try:
+                    old_year = appt.start_at.year
+                    if old_year != d.year:
+                        recreate = True
+                except Exception:
+                    pass
+
+            if appt.event_id and not recreate:
                 try:
                     logger.info("Intentando update_event en GCAL: event_id=%s -> %s %s (local)", appt.event_id, date_iso, time_hhmm)
                     update_event(appt.event_id, start_dt_local_naive, duration_min=duration)
                     logger.info("GCAL update_event OK: event_id=%s", appt.event_id)
                 except Exception as e_upd:
                     logger.warning("GCAL update_event falló; recreando. appt_id=%s err=%s", getattr(appt, "id", None), e_upd)
-                    # Fallback: borra y crea
                     try:
                         delete_event(appt.event_id)
                     except Exception as e_del:
                         logger.warning("GCAL delete_event falló durante fallback: %s", e_del)
                     appt.event_id = None
 
-            if not appt.event_id:
-                # Crear desde cero
+            if not appt.event_id or recreate:
+                if recreate and appt.event_id:
+                    try:
+                        delete_event(appt.event_id)
+                    except Exception as e_del:
+                        logger.warning("GCAL delete_event falló durante recreate: %s", e_del)
+                    appt.event_id = None
+
                 logger.info("Creando evento en GCAL: contact=%s patient=%s start_local_naive=%s tz=%s",
                             contact, patient.name, appt.start_at.isoformat(), tzname)
                 new_id = create_event(
@@ -495,6 +497,9 @@ SYSTEM_PROMPT = (
        - **Nunca** confirmes sin eco explícito de **FECHA + HORA + NOMBRE**.
        - Frase sugerida para el nombre: “Para confirmar, ¿me comparte el nombre y apellido del paciente, por favor?”.
        - Confirmación: “Quedó para el 📅 DD/MM/AAAA a las ⏰ HH:MM a nombre de NOMBRE.”
+       - Si el usuario ya indica **fecha y hora específicas en el mismo mensaje** (p. ej. “30/09 a las 19:00”),
+         **NO** llames a `check_slots` primero: pide directamente el nombre y apellido y luego llama a `book_appointment`.
+         Si `book_appointment` respondiera `slot_unavailable`, entonces sí ofrece alternativas del mismo día.
     5) Horario no disponible:
        - Si el servidor indica `slot_unavailable`, ofrece 4–8 alternativas del mismo día.
     6) Reprogramación/cancelación:
@@ -811,35 +816,29 @@ def run_agent(contact: str, user_text: str) -> str:
                 args = _coerce_json(call.function.arguments)
 
                 # Autorrellenos útiles previos a ejecutar la tool
-                if name in ("book_appointment", "reschedule_appointment"):
+                if name in ("book_appointment", "reschedule_appointment", "check_slots"):
                     # Normaliza hora si viene "7 pm"
                     if args.get("time_hhmm") and re.search(r"[ap]m\b", str(args["time_hhmm"]).lower()):
                         norm = hhmm_from_text_or_none(args["time_hhmm"])
                         if norm:
                             args["time_hhmm"] = norm
 
-                    # ▶ Fuerza SIEMPRE el último HINT_FECHA si existe
-                    if _LAST_DATE_HINT.get(contact):
-                        args["date_iso"] = _LAST_DATE_HINT[contact]
+                    # a) Sanitiza fecha hacia futuro si ya viene date_iso
+                    if args.get("date_iso"):
+                        args["date_iso"] = _sanitize_future_date(args["date_iso"])
+                    else:
+                        # b) Si no viene, usa HINT_FECHA o última fecha de slots
+                        chosen = _LAST_DATE_HINT.get(contact) or _LAST_SLOTS_DATE.get(contact)
+                        if chosen:
+                            args["date_iso"] = _sanitize_future_date(chosen)
 
+                    # c) Idempotencia / canales
                     if name == "book_appointment":
                         args.setdefault("channel", "whatsapp")
                         args.setdefault("client_request_id", f"{contact}-{uuid.uuid4().hex[:8]}")
                     if name == "reschedule_appointment":
                         args.setdefault("client_request_id", f"{contact}-{uuid.uuid4().hex[:8]}")
 
-                    # --- Saneos previos a ejecutar la tool ---
-                    # a) Si la tool es de fecha, normaliza a FUTURO
-                    if name in ("check_slots", "book_appointment", "reschedule_appointment"):
-                        if args.get("date_iso"):
-                            args["date_iso"] = _sanitize_future_date(args["date_iso"])
-
-                    # b) Para agendar/reagendar: si tenemos un hint o la última fecha consultada, úsala como fuente de verdad
-                    if name in ("book_appointment", "reschedule_appointment"):
-                        chosen_date = _LAST_DATE_HINT.get(contact) or _LAST_SLOTS_DATE.get(contact)
-                        if chosen_date:
-                            args["date_iso"] = _sanitize_future_date(chosen_date)
-                            
                 # Ejecuta tool y captura resultado
                 try:
                     result = _dispatch_tool(contact, name, args)
@@ -876,16 +875,14 @@ def run_agent(contact: str, user_text: str) -> str:
         try:
             prefer_date = _LAST_DATE_HINT.get(contact) or _LAST_SLOTS_DATE.get(contact)
             if prefer_date:
-                # prefer_date viene en YYYY-MM-DD
                 y_pref, m_pref, d_pref = prefer_date.split("-")
                 prefer_visible = f"{int(d_pref):02d}/{int(m_pref):02d}/{y_pref}"
 
-                # Si el texto contiene una fecha dd/mm/aaaa con mismo día/mes pero año distinto → reemplazar por prefer_visible
                 def _fix_year(m):
-                    d, mth, y = m.group(1), m.group(2), m.group(3)
-                    if d == f"{int(d_pref):02d}" and mth == f"{int(m_pref):02d}" and y != y_pref:
+                    d_, mth, y = m.group(1), m.group(2), m.group(3)
+                    if d_ == f"{int(d_pref):02d}" and mth == f"{int(m_pref):02d}" and y != y_pref:
                         return prefer_visible
-                    return f"{d}/{mth}/{y}"
+                    return f"{d_}/{mth}/{y}"
 
                 final_text = re.sub(r"\b([0-3]\d)/(0\d|1[0-2])/(19|20)\d{2}\b", _fix_year, final_text)
         except Exception:
