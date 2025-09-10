@@ -872,6 +872,25 @@ def run_agent(contact: str, user_text: str) -> str:
         except Exception:
             pass
 
+        # 🔧 Forzar que las fechas mostradas usen la última fecha normalizada (HINT o slots)
+        try:
+            prefer_date = _LAST_DATE_HINT.get(contact) or _LAST_SLOTS_DATE.get(contact)
+            if prefer_date:
+                # prefer_date viene en YYYY-MM-DD
+                y_pref, m_pref, d_pref = prefer_date.split("-")
+                prefer_visible = f"{int(d_pref):02d}/{int(m_pref):02d}/{y_pref}"
+
+                # Si el texto contiene una fecha dd/mm/aaaa con mismo día/mes pero año distinto → reemplazar por prefer_visible
+                def _fix_year(m):
+                    d, mth, y = m.group(1), m.group(2), m.group(3)
+                    if d == f"{int(d_pref):02d}" and mth == f"{int(m_pref):02d}" and y != y_pref:
+                        return prefer_visible
+                    return f"{d}/{mth}/{y}"
+
+                final_text = re.sub(r"\b([0-3]\d)/(0\d|1[0-2])/(19|20)\d{2}\b", _fix_year, final_text)
+        except Exception:
+            pass
+
         messages.append({"role": "assistant", "content": final_text})
         _save_mem(contact, messages, greeted=True)
         return final_text
