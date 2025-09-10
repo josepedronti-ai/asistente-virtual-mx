@@ -193,28 +193,51 @@ def hhmm_from_text_or_none(text: str) -> str | None:
 # Herramientas (llamadas por el Agente)
 # -----------------------
 def tool_check_slots(contact: str, date_iso: str):
+    # Normaliza la fecha pedida a FUTURO (evita viajar a años pasados)
     tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
-    today_local = datetime.now(ZoneInfo(tzname)).date()
+    tz = ZoneInfo(tzname)
+    today_local = datetime.now(tz).date()
 
     try:
         d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     except Exception:
         d = today_local
 
-    # 🔒 Clamp de seguridad: si la fecha está >30 días en el pasado, mueve dd/mm a futuro
-    if d < (today_local - timedelta(days=30)):
+    # Si viene con año anterior, súbelo al año actual; si aún queda en pasado, súbelo un año más
+    if d.year < today_local.year:
         try:
-            d_this_year = date(today_local.year, d.month, d.day)
-            if d_this_year >= today_local:
-                d = d_this_year
-            else:
-                d = date(today_local.year + 1, d.month, d.day)
-        except Exception:
+            d = d.replace(year=today_local.year)
+        except ValueError:
+            # p.ej. 29/02 en año no bisiesto → usa hoy
+            d = today_local
+    if d < today_local:
+        try:
+            d = d.replace(year=d.year + 1)
+        except ValueError:
             d = today_local
 
     for db in db_session():
         slots = available_slots(db, d, tzname) or []
-        # guarda la fecha normalizada para posteriores tool-calls
+        # guarda la fecha ya saneada para posteriores tool-calls
+        _LAST_SLOTS_DATE[contact] = d.isoformat()
+        return {"date_iso": d.isoformat(), "slots": [s.strftime("%H:%M") for s in slots]}
+
+    # Si viene con año anterior, súbelo al año actual; si aún queda en pasado, súbelo un año más
+    if d.year < today_local.year:
+        try:
+            d = d.replace(year=today_local.year)
+        except ValueError:
+            # p.ej. 29/02 en año no bisiesto → usa hoy
+            d = today_local
+    if d < today_local:
+        try:
+            d = d.replace(year=d.year + 1)
+        except ValueError:
+            d = today_local
+
+    for db in db_session():
+        slots = available_slots(db, d, tzname) or []
+        # guarda la fecha ya saneada para posteriores tool-calls
         _LAST_SLOTS_DATE[contact] = d.isoformat()
         return {"date_iso": d.isoformat(), "slots": [s.strftime("%H:%M") for s in slots]}
 
@@ -694,6 +717,29 @@ def _coerce_json(obj):
             return {}
     return {}
 
+def _sanitize_future_date(date_str: str | None) -> str | None:
+    if not date_str:
+        return None
+    tzname = getattr(settings, "TIMEZONE", "America/Monterrey") or "America/Monterrey"
+    tz = ZoneInfo(tzname)
+    today_local = datetime.now(tz).date()
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        return today_local.isoformat()
+    # Sube años pasados al año actual; si aún queda en pasado, súbelo un año más
+    if d.year < today_local.year:
+        try:
+            d = d.replace(year=today_local.year)
+        except ValueError:
+            d = today_local
+    if d < today_local:
+        try:
+            d = d.replace(year=d.year + 1)
+        except ValueError:
+            d = today_local
+    return d.isoformat()
+
 def run_agent(contact: str, user_text: str) -> str:
     """
     Orquesta la conversación con el modelo y ejecuta herramientas locales.
@@ -782,6 +828,18 @@ def run_agent(contact: str, user_text: str) -> str:
                     if name == "reschedule_appointment":
                         args.setdefault("client_request_id", f"{contact}-{uuid.uuid4().hex[:8]}")
 
+                    # --- Saneos previos a ejecutar la tool ---
+                    # a) Si la tool es de fecha, normaliza a FUTURO
+                    if name in ("check_slots", "book_appointment", "reschedule_appointment"):
+                        if args.get("date_iso"):
+                            args["date_iso"] = _sanitize_future_date(args["date_iso"])
+
+                    # b) Para agendar/reagendar: si tenemos un hint o la última fecha consultada, úsala como fuente de verdad
+                    if name in ("book_appointment", "reschedule_appointment"):
+                        chosen_date = _LAST_DATE_HINT.get(contact) or _LAST_SLOTS_DATE.get(contact)
+                        if chosen_date:
+                            args["date_iso"] = _sanitize_future_date(chosen_date)
+                            
                 # Ejecuta tool y captura resultado
                 try:
                     result = _dispatch_tool(contact, name, args)
